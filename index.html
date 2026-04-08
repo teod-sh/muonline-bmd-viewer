@@ -21,6 +21,32 @@
           <h2 class="sidebar-title">🛠 Controls</h2>
         </div>
 
+        <div class="control-section explorer-panel" id="explorer-panel">
+          <h3>Explorer</h3>
+          <input id="explorer-search" class="animation-dropdown full-width mb-sm" type="search"
+            placeholder="Search worlds, bookmarks, presets">
+          <div class="checkbox-control compact-control">
+            <label for="presentation-mode-toggle">Presentation Mode</label>
+            <input type="checkbox" id="presentation-mode-toggle" class="modern-checkbox">
+          </div>
+          <div class="explorer-group">
+            <div class="explorer-group-title">Worlds</div>
+            <div id="explorer-worlds-list" class="explorer-list"></div>
+          </div>
+          <div class="explorer-group">
+            <div class="explorer-group-title">Bookmarks</div>
+            <div id="explorer-bookmarks-list" class="explorer-list"></div>
+          </div>
+          <div class="explorer-group">
+            <div class="explorer-group-title">Characters</div>
+            <div id="explorer-characters-list" class="explorer-list"></div>
+          </div>
+          <div class="explorer-group">
+            <div class="explorer-group-title">Recent Models</div>
+            <div id="explorer-models-list" class="explorer-list"></div>
+          </div>
+        </div>
+
         <div class="sidebar-tabs" id="sidebar-tabs">
           <button class="tab-btn active" data-view="bmd">Model Viewer</button>
           <button class="tab-btn" data-view="character">Test Animation Scene</button>
@@ -126,6 +152,7 @@
                   value="2.0">
               </div>
             </div>
+
           </div>
 
           <div class="control-section initially-hidden" id="blending-controls">
@@ -304,6 +331,16 @@
           </div>
 
           <div class="control-section">
+            <h3>Presets</h3>
+            <div class="row-inline">
+              <input id="character-preset-name" type="text" class="animation-dropdown full-width"
+                placeholder="Preset name">
+              <button id="character-save-preset-btn" class="modern-btn btn-primary">Save</button>
+            </div>
+            <p id="character-preset-status" class="control-note">Save current class, gear and render state.</p>
+          </div>
+
+          <div class="control-section">
             <h3>Animation Settings</h3>
             <div class="slider-control">
               <div class="slider-label">
@@ -425,6 +462,23 @@
           </div>
 
           <div class="control-section">
+            <h3>Navigation</h3>
+            <canvas id="terrain-minimap-canvas" class="terrain-minimap" width="220" height="220"></canvas>
+            <div class="row-inline space-top-sm">
+              <input id="terrain-jump-x" type="number" class="frame-input input-w-lg" placeholder="X">
+              <input id="terrain-jump-z" type="number" class="frame-input input-w-lg" placeholder="Z">
+              <button id="terrain-jump-btn" class="modern-btn btn-primary">Jump</button>
+            </div>
+            <div class="row-inline space-top-sm">
+              <input id="terrain-bookmark-name" type="text" class="animation-dropdown full-width"
+                placeholder="Bookmark name">
+              <button id="terrain-save-bookmark-btn" class="modern-btn">Save</button>
+            </div>
+            <p id="terrain-bookmark-status" class="control-note">Save camera and selected object as a bookmark.</p>
+            <p id="terrain-last-context" class="control-note accent-note"></p>
+          </div>
+
+          <div class="control-section">
             <h3>Viewport</h3>
             <div class="checkbox-control">
               <label for="terrain-wireframe">Wireframe</label>
@@ -443,8 +497,28 @@
               <div class="brightness-control">
                 <label id="terrain-object-distance-label" for="terrain-object-distance-slider">Object Distance</label>
                 <input type="range" id="terrain-object-distance-slider" class="modern-slider" min="2000" max="32000"
-                  step="200" value="12000">
+                  step="200" value="6000">
               </div>
+            </div>
+          </div>
+
+          <div class="control-section">
+            <h3>Selected Object</h3>
+            <div id="terrain-object-empty" class="control-note">No object selected.</div>
+            <div id="terrain-object-details" class="hidden">
+              <p>World: <span id="terrain-selected-world">-</span></p>
+              <p>Type: <span id="terrain-selected-type">-</span></p>
+              <p>Model: <span id="terrain-selected-model">-</span></p>
+              <p>Position: <span id="terrain-selected-position">-</span></p>
+              <p>Rotation: <span id="terrain-selected-rotation">-</span></p>
+              <p>Scale: <span id="terrain-selected-scale">-</span></p>
+              <div class="stack-sm space-top-sm">
+                <button id="terrain-focus-object-btn" class="modern-btn btn-primary">Focus</button>
+                <button id="terrain-isolate-object-btn" class="modern-btn">Hide Others</button>
+                <button id="terrain-reset-isolate-btn" class="modern-btn">Reset</button>
+                <button id="terrain-open-model-btn" class="modern-btn">Open in Model Viewer</button>
+              </div>
+              <p id="terrain-open-model-hint" class="control-note"></p>
             </div>
           </div>
 
@@ -506,6 +580,9 @@
 
       <div id="terrain-status-bar">Ready</div>
     </main>
+
+    <div id="presentation-overlay" class="presentation-overlay hidden"></div>
+    <button id="presentation-exit-btn" class="presentation-exit hidden">Exit Presentation</button>
   </div>
 
   <script>
