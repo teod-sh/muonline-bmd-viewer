@@ -73,6 +73,7 @@ export function createDefaultTerrainSessionState(): TerrainSessionState {
 
 export function createDefaultBmdSessionState(): BmdSessionState {
   return {
+    rendererBackend: 'auto',
     autoRotate: true,
     showSkeleton: false,
     wireframe: false,
@@ -212,6 +213,9 @@ function mergeBmdSessionState(raw: unknown): BmdSessionState {
   const input = safeObject<BmdSessionState>(raw);
 
   return {
+    rendererBackend: input.rendererBackend === 'webgpu' || input.rendererBackend === 'webgl'
+      ? input.rendererBackend
+      : defaults.rendererBackend,
     autoRotate: coerceBoolean(input.autoRotate, defaults.autoRotate),
     showSkeleton: coerceBoolean(input.showSkeleton, defaults.showSkeleton),
     wireframe: coerceBoolean(input.wireframe, defaults.wireframe),

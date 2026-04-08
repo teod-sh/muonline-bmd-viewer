@@ -38,6 +38,7 @@ describe('mergeViewerSessionState', () => {
         equipment: { helm: '7:12' },
       },
       bmd: {
+        rendererBackend: 'webgpu',
         lastModelName: 'Tree01.bmd',
       },
     });
@@ -61,6 +62,7 @@ describe('mergeViewerSessionState', () => {
     expect(merged.character.equipment.helm).toBe('7:12');
     expect(merged.character.equipment.armor).toBe('');
     expect(merged.bmd.lastModelName).toBe('Tree01.bmd');
+    expect(merged.bmd.rendererBackend).toBe('webgpu');
   });
 
   it('drops malformed collections instead of crashing', () => {

@@ -100,6 +100,7 @@ export interface TerrainSessionState {
 }
 
 export interface BmdSessionState {
+  rendererBackend: 'auto' | 'webgpu' | 'webgl';
   autoRotate: boolean;
   showSkeleton: boolean;
   wireframe: boolean;

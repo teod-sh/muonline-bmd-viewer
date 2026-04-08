@@ -1,5 +1,6 @@
 // src/main.ts
 import * as THREE from 'three';
+import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { VertexNormalsHelper } from 'three/examples/jsm/helpers/VertexNormalsHelper.js';
@@ -34,6 +35,10 @@ import './style.css';
 let skeletonHelper: THREE.SkeletonHelper | null = null;
 const showSkeletonEl = document.getElementById('show-skeleton-checkbox') as HTMLInputElement;
 const wireframeEl    = document.getElementById('wireframe-checkbox')    as HTMLInputElement;
+type SupportedRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
+type RendererBackendPreference = BmdSessionState['rendererBackend'];
+type RendererBackendActive = 'webgpu' | 'webgl';
+const MODEL_VIEWER_PIXEL_RATIO_MAX = 2;
 
 class App {
     public onStateChanged?: (state: BmdSessionState) => void;
@@ -41,7 +46,7 @@ class App {
 
     private scene!: THREE.Scene;
     private camera!: THREE.PerspectiveCamera;
-    private renderer!: THREE.WebGLRenderer;
+    private renderer!: SupportedRenderer;
     private controls!: OrbitControls;
     private timer: THREE.Timer = new THREE.Timer();
     private ambientLight!: THREE.AmbientLight;
@@ -67,6 +72,7 @@ class App {
     private textureLoader = new THREE.TextureLoader();
     private lastBmdFilePath: string | null = null;  // For Electron auto-texture search
     private lastAttachmentFilePath: string | null = null;  // For Electron auto-texture search (attachments)
+    private appliedTextureFiles = new Map<string, File>();
 
     // ### NEW ### For rotation
     private isAutoRotating = true;
@@ -113,9 +119,19 @@ class App {
     private normalsUpdateCounter = 0;
     private pendingRecentModelContext: { label: string; modelFileKey: string | null; sourceWorldNumber: number | null } | null = null;
     private presentationMode = false;
+    private rendererBackendPreference: RendererBackendPreference;
+    private rendererActiveBackend: RendererBackendActive = 'webgl';
+    private rendererReady = false;
+    private rendererSwapToken = 0;
+    private containerEl!: HTMLElement;
+    private resizeHandler: (() => void) | null = null;
+    private rendererBackendSelect: HTMLSelectElement | null = null;
+    private rendererBackendStatusEl: HTMLElement | null = null;
+    private environmentTarget: THREE.WebGLRenderTarget | null = null;
 
-    constructor() {
+    constructor(initialRendererBackend: RendererBackendPreference = 'auto') {
         logger.debug('%c[App] constructor', 'color:#0f0');
+        this.rendererBackendPreference = initialRendererBackend;
         this.initThree();
         this.initUI();
         this.animate(performance.now());
@@ -156,6 +172,7 @@ class App {
         const bgInput = document.getElementById('bg-color-input') as HTMLInputElement | null;
         const brightnessSlider = document.getElementById('brightness-slider') as HTMLInputElement | null;
         return {
+            rendererBackend: this.rendererBackendPreference,
             autoRotate: this.isAutoRotating,
             showSkeleton: showSkeletonEl.checked,
             wireframe: wireframeEl.checked,
@@ -173,6 +190,14 @@ class App {
         const brightnessSlider = document.getElementById('brightness-slider') as HTMLInputElement | null;
         const brightnessLabel = document.getElementById('brightness-label');
         const autoRotateCheckbox = document.getElementById('auto-rotate-checkbox') as HTMLInputElement | null;
+        const backendSelect = this.rendererBackendSelect;
+
+        if (backendSelect) {
+            backendSelect.value = state.rendererBackend;
+        }
+        if (state.rendererBackend !== this.rendererBackendPreference) {
+            void this.setRendererBackend(state.rendererBackend, { persistState: false });
+        }
 
         if (autoRotateCheckbox) {
             autoRotateCheckbox.checked = state.autoRotate;
@@ -226,6 +251,14 @@ class App {
         await this.handleBmdFile(file, options?.filePath ?? undefined, options?.textureFiles);
     }
 
+    private rememberAppliedTextureFile(file: File) {
+        this.appliedTextureFiles.set(file.name.toLowerCase(), file);
+    }
+
+    private getAppliedTextureFiles(): File[] {
+        return Array.from(this.appliedTextureFiles.values());
+    }
+
     //----------------------------------------------------------
     // THREE.JS (no changes)
     //----------------------------------------------------------
@@ -233,6 +266,7 @@ class App {
         logger.groupDebug('%c[App] initThree()', 'color:#0f0');
         const container = document.getElementById('canvas-container');
         if (!container) throw new Error('#canvas-container not found in HTML!');
+        this.containerEl = container;
 
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x0b1322);
@@ -240,42 +274,9 @@ class App {
 
         this.camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 10000);
         this.camera.position.set(0, 200, 400);
-
-        this.renderer = new THREE.WebGLRenderer({
-            antialias: true,
-            alpha: true,
-            preserveDrawingBuffer: true, // keep frame buffer for GIF capture
-        });
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        this.renderer.toneMappingExposure = 0.95;
-        this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFShadowMap;
-        this.renderer.setSize(container.clientWidth, container.clientHeight);
-        container.appendChild(this.renderer.domElement);
         this.timer.connect(document);
-
-        const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
-        const environmentScene = new RoomEnvironment();
-        this.scene.environment = pmremGenerator.fromScene(environmentScene).texture;
-        environmentScene.dispose();
-        pmremGenerator.dispose();
-
-        window.addEventListener('resize', () => {
-            this.camera.aspect = container.clientWidth / container.clientHeight;
-            this.camera.updateProjectionMatrix();
-            this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-            this.renderer.setSize(container.clientWidth, container.clientHeight);
-        });
-
-        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-        this.controls.enableDamping = true;
-        this.controls.target.set(0, 90, 0);
-
-        // ### NEW ### Pause rotation during interaction
-        this.controls.addEventListener('start', () => { this.userIsInteracting = true; });
-        this.controls.addEventListener('end', () => { this.userIsInteracting = false; });
+        this.bindResizeHandler();
+        void this.setRendererBackend(this.rendererBackendPreference, { persistState: false, announceStatus: false });
 
         this.ambientLight = new THREE.AmbientLight(0xcde3ff, 0.42);
         this.hemisphereLight = new THREE.HemisphereLight(0x89d7ff, 0x111a27, 0.52);
@@ -321,6 +322,261 @@ class App {
         logger.groupEnd();
     }
 
+    private bindResizeHandler() {
+        if (this.resizeHandler) {
+            return;
+        }
+
+        this.resizeHandler = () => {
+            this.refreshRendererSize();
+        };
+        window.addEventListener('resize', this.resizeHandler);
+    }
+
+    private refreshRendererSize(renderer: SupportedRenderer | null = this.renderer ?? null) {
+        if (!renderer || !this.containerEl) {
+            return;
+        }
+
+        const width = this.containerEl.clientWidth;
+        const height = this.containerEl.clientHeight;
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, MODEL_VIEWER_PIXEL_RATIO_MAX));
+        renderer.setSize(width, height);
+    }
+
+    private createClassicWebGLRenderer(): THREE.WebGLRenderer {
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true,
+            preserveDrawingBuffer: true,
+            powerPreference: 'high-performance',
+        });
+        renderer.debug.checkShaderErrors = false;
+        return renderer;
+    }
+
+    private createPreferredRenderer(preference: RendererBackendPreference): SupportedRenderer {
+        if (preference === 'webgl') {
+            return this.createClassicWebGLRenderer();
+        }
+
+        return new WebGPURenderer({
+            antialias: true,
+            alpha: true,
+        });
+    }
+
+    private configureRendererInstance(renderer: SupportedRenderer) {
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.95;
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFShadowMap;
+        this.refreshRendererSize(renderer);
+    }
+
+    private createControls(domElement: HTMLCanvasElement, target?: THREE.Vector3) {
+        this.controls = new OrbitControls(this.camera, domElement);
+        this.controls.enableDamping = true;
+        this.controls.target.copy(target ?? new THREE.Vector3(0, 90, 0));
+        this.controls.addEventListener('start', () => { this.userIsInteracting = true; });
+        this.controls.addEventListener('end', () => { this.userIsInteracting = false; });
+        this.controls.update();
+    }
+
+    private disposeEnvironmentTarget() {
+        if (this.environmentTarget) {
+            this.environmentTarget.dispose();
+            this.environmentTarget = null;
+        }
+        this.scene.environment = null;
+    }
+
+    private updateEnvironmentForRenderer(renderer: SupportedRenderer) {
+        this.disposeEnvironmentTarget();
+        if (!(renderer instanceof THREE.WebGLRenderer)) {
+            return;
+        }
+
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        const environmentScene = new RoomEnvironment();
+        this.environmentTarget = pmremGenerator.fromScene(environmentScene);
+        this.scene.environment = this.environmentTarget.texture;
+        environmentScene.dispose();
+        pmremGenerator.dispose();
+    }
+
+    private getActiveRendererBackend(renderer: SupportedRenderer): RendererBackendActive {
+        if (renderer instanceof THREE.WebGLRenderer) {
+            return 'webgl';
+        }
+
+        return (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? 'webgpu' : 'webgl';
+    }
+
+    private updateRendererBackendStatus(message?: string) {
+        if (!this.rendererBackendStatusEl) {
+            return;
+        }
+
+        if (message) {
+            this.rendererBackendStatusEl.textContent = message;
+            return;
+        }
+
+        const preferred = this.rendererBackendPreference === 'auto'
+            ? 'Auto'
+            : this.rendererBackendPreference === 'webgpu'
+                ? 'WebGPU'
+                : 'WebGL';
+        const active = this.rendererActiveBackend === 'webgpu' ? 'WebGPU' : 'WebGL';
+        this.rendererBackendStatusEl.textContent = `Renderer: ${active} active (preferred: ${preferred})`;
+    }
+
+    private async reloadCurrentModelAfterRendererSwitchWithAssets(
+        textureFiles: File[],
+        attachmentFile: File | null,
+        attachmentBoneIndex: number,
+    ) {
+        if (!this.bmdFile) {
+            return;
+        }
+
+        const attachBoneSelect = document.getElementById('attach-bone-select') as HTMLSelectElement | null;
+        const statusEl = document.getElementById('status');
+        if (statusEl) {
+            statusEl.textContent = 'Renderer changed. Rebuilding model resources…';
+        }
+
+        await this.loadAndDisplayModel({
+            textureFiles,
+            suppressRecent: true,
+            skipClear: true,
+        });
+
+        if (attachmentFile) {
+            this.currentAttachmentFile = attachmentFile;
+            if (!Number.isNaN(attachmentBoneIndex) && attachmentBoneIndex >= 0) {
+                await this.loadAttachmentAtBone(attachmentBoneIndex);
+                if (attachBoneSelect) {
+                    attachBoneSelect.value = `${attachmentBoneIndex}`;
+                }
+            } else {
+                await this.setupAttachmentControls();
+            }
+        }
+    }
+
+    private async setRendererBackend(
+        preference: RendererBackendPreference,
+        options: { persistState?: boolean; announceStatus?: boolean } = {},
+    ) {
+        const persistState = options.persistState ?? true;
+        const announceStatus = options.announceStatus ?? true;
+        const currentRenderer = this.renderer;
+        const currentBackend = currentRenderer ? this.getActiveRendererBackend(currentRenderer) : null;
+        const shouldReloadModel = !!currentRenderer && !!this.bmdFile && !!this.loadedGroup;
+        const reloadTextureFiles = shouldReloadModel ? this.getAppliedTextureFiles() : [];
+        const attachmentFile = shouldReloadModel ? this.currentAttachmentFile : null;
+        const attachBoneSelect = document.getElementById('attach-bone-select') as HTMLSelectElement | null;
+        const attachmentBoneIndex = attachBoneSelect ? parseInt(attachBoneSelect.value, 10) : NaN;
+        const isSameExplicitBackend =
+            preference !== 'auto' &&
+            currentRenderer &&
+            currentBackend === preference &&
+            this.rendererBackendPreference === preference &&
+            this.rendererReady;
+
+        if (isSameExplicitBackend) {
+            return;
+        }
+
+        const token = ++this.rendererSwapToken;
+        const previousTarget = this.controls?.target.clone() ?? new THREE.Vector3(0, 90, 0);
+        const previousDomElement = currentRenderer?.domElement ?? null;
+
+        this.rendererBackendPreference = preference;
+        if (this.rendererBackendSelect && this.rendererBackendSelect.value !== preference) {
+            this.rendererBackendSelect.value = preference;
+        }
+
+        this.rendererReady = false;
+        this.userIsInteracting = false;
+        this.updateRendererBackendStatus(`Renderer: switching to ${preference === 'auto' ? 'Auto' : preference}…`);
+
+        if (shouldReloadModel) {
+            this.clearScene();
+            this.loadedGroup = null;
+            this.requiredTextures = [];
+            this.currentAttachment = null;
+            this.currentAttachmentFile = attachmentFile;
+        }
+
+        let renderer = this.createPreferredRenderer(preference);
+        this.configureRendererInstance(renderer);
+
+        let fallbackReason: string | null = null;
+
+        if (!(renderer instanceof THREE.WebGLRenderer)) {
+            try {
+                await renderer.init();
+            } catch (error) {
+                fallbackReason = error instanceof Error ? error.message : 'WebGPU initialization failed';
+                renderer.dispose();
+                renderer = this.createClassicWebGLRenderer();
+                this.configureRendererInstance(renderer);
+            }
+        }
+
+        if (token !== this.rendererSwapToken) {
+            renderer.dispose();
+            return;
+        }
+
+        if (this.controls) {
+            this.controls.dispose();
+        }
+        if (previousDomElement?.parentElement === this.containerEl) {
+            previousDomElement.parentElement.removeChild(previousDomElement);
+        }
+
+        this.containerEl.appendChild(renderer.domElement);
+        this.createControls(renderer.domElement, previousTarget);
+        currentRenderer?.dispose();
+        this.renderer = renderer;
+        this.rendererActiveBackend = this.getActiveRendererBackend(renderer);
+        this.updateEnvironmentForRenderer(renderer);
+        this.setBrightness(parseFloat((document.getElementById('brightness-slider') as HTMLInputElement | null)?.value || '2') || 2);
+        if (shouldReloadModel) {
+            await this.reloadCurrentModelAfterRendererSwitchWithAssets(reloadTextureFiles, attachmentFile, attachmentBoneIndex);
+        }
+        this.rendererReady = true;
+
+        if (announceStatus) {
+            if (fallbackReason) {
+                this.setStatusMessage(`WebGPU init failed, using WebGL. ${fallbackReason}`);
+            } else if (preference !== 'webgl') {
+                this.setStatusMessage(`Renderer backend: ${this.rendererActiveBackend === 'webgpu' ? 'WebGPU' : 'WebGL fallback'} ready.`);
+            }
+        }
+
+        this.updateRendererBackendStatus(
+            fallbackReason
+                ? `Renderer: WebGL fallback active (${fallbackReason})`
+                : undefined,
+        );
+
+        if (persistState) {
+            this.emitStateChanged();
+        }
+    }
+
     //----------------------------------------------------------
     // UI - Modified
     //----------------------------------------------------------
@@ -342,6 +598,8 @@ class App {
         this.gifHeightInput = document.getElementById('gif-height-input') as HTMLInputElement;
         this.gifDelayInput  = document.getElementById('gif-delay-input')  as HTMLInputElement;
         this.gifFrameMultiplierInput = document.getElementById('gif-frame-multiplier-input') as HTMLInputElement;
+        this.rendererBackendSelect = document.getElementById('renderer-backend-select') as HTMLSelectElement | null;
+        this.rendererBackendStatusEl = document.getElementById('renderer-backend-status');
 
         const exportGifBtn = document.getElementById('export-gif-btn') as HTMLButtonElement;
         exportGifBtn.addEventListener('click', () => this.exportGif());
@@ -356,6 +614,18 @@ class App {
             this.emitStateChanged();
         });
         speedLabel.textContent = `Speed: ${parseFloat(speedSlider.value).toFixed(2)}x`;
+
+        if (this.rendererBackendSelect) {
+            this.rendererBackendSelect.value = this.rendererBackendPreference;
+            this.rendererBackendSelect.addEventListener('change', () => {
+                const selectedValue = this.rendererBackendSelect?.value;
+                const value: RendererBackendPreference = selectedValue === 'webgpu' || selectedValue === 'webgl'
+                    ? selectedValue
+                    : 'auto';
+                void this.setRendererBackend(value, { persistState: true });
+            });
+        }
+        this.updateRendererBackendStatus();
 
         const status = document.getElementById('status')!;
         status.textContent = 'Waiting for BMD file…';
@@ -809,8 +1079,9 @@ class App {
 
             this.bmdFile = file;
             this.lastBmdFilePath = filePath || null;  // Store file path for Electron texture search
+            this.appliedTextureFiles.clear();
             document.querySelector('#bmd-drop-zone p')!.textContent = `Selected: ${file.name}`;
-            await this.loadAndDisplayModel(textureFiles);
+            await this.loadAndDisplayModel({ textureFiles });
         } catch (error) {
             if (error instanceof FileValidationError) {
                 alert(`Invalid file: ${error.message}`);
@@ -885,6 +1156,10 @@ class App {
 
     private exportGif() {
         if (this.isRecordingGif) return;
+        if (!this.rendererReady) {
+            this.setStatusMessage('Renderer is still initializing.');
+            return;
+        }
         if (!this.loadedGroup) {
             alert('Load a BMD model first.');
             return;
@@ -1058,17 +1333,22 @@ class App {
     //----------------------------------------------------------
     // MODEL LOADING - Modified
     //----------------------------------------------------------
-    private async loadAndDisplayModel(textureFiles?: File[]) {
+    private async loadAndDisplayModel(options?: { textureFiles?: File[]; suppressRecent?: boolean; skipClear?: boolean }) {
         if (!this.bmdFile) return;
+        const textureFiles = options?.textureFiles;
+        const suppressRecent = options?.suppressRecent ?? false;
+        const skipClear = options?.skipClear ?? false;
         const statusEl = document.getElementById('status')!;
         statusEl.textContent = 'Loading model…';
         logger.groupDebug('loadAndDisplayModel()');
         logger.time('loadAndDisplayModel');
 
         // Reset state
-        this.clearScene();
-        this.loadedGroup = null;
-        this.requiredTextures = [];
+        if (!skipClear) {
+            this.clearScene();
+            this.loadedGroup = null;
+            this.requiredTextures = [];
+        }
         document.getElementById('texture-controls')!.style.display = 'none';
 
         try {
@@ -1092,14 +1372,16 @@ class App {
             if (this.exportBtn) this.exportBtn.disabled = false;
             this.emitStateChanged();
 
-            const recentEntry: RecentModelEntry = {
-                label: this.pendingRecentModelContext?.label || this.bmdFile?.name || 'Model',
-                timestamp: Date.now(),
-                modelFileKey: this.pendingRecentModelContext?.modelFileKey ?? null,
-                sourceWorldNumber: this.pendingRecentModelContext?.sourceWorldNumber ?? null,
-            };
-            this.onModelLoaded?.(recentEntry);
-            this.pendingRecentModelContext = null;
+            if (!suppressRecent) {
+                const recentEntry: RecentModelEntry = {
+                    label: this.pendingRecentModelContext?.label || this.bmdFile?.name || 'Model',
+                    timestamp: Date.now(),
+                    modelFileKey: this.pendingRecentModelContext?.modelFileKey ?? null,
+                    sourceWorldNumber: this.pendingRecentModelContext?.sourceWorldNumber ?? null,
+                };
+                this.onModelLoaded?.(recentEntry);
+                this.pendingRecentModelContext = null;
+            }
 
             if (textureFiles?.length) {
                 let autoAppliedCount = 0;
@@ -1517,6 +1799,9 @@ class App {
             status.textContent = applied
                 ? `Texture "${file.name}" loaded (blend: ${describeBlendMode((firstAppliedResult || blendResult).mode)}, ${Math.round((firstAppliedResult || blendResult).confidence * 100)}%).`
                 : `No matching mesh found for "${file.name}". Check the console.`;
+            if (applied) {
+                this.rememberAppliedTextureFile(file);
+            }
             return applied;
         } else {
             const matchedMeshes = meshList.filter(m => m.isMatch);
@@ -1538,6 +1823,7 @@ class App {
                 if (this.exportBtn) this.exportBtn.disabled = false;
                 const firstBlend = getBlendForHint(matchedMeshes[0].path);
                 status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(firstBlend.mode)}, ${Math.round(firstBlend.confidence * 100)}%).`;
+                this.rememberAppliedTextureFile(file);
                 return true;
             }
 
@@ -1572,6 +1858,7 @@ class App {
                 this.applyBlackKeyThresholdToMaterial(mat);
                 if (this.exportBtn) this.exportBtn.disabled = false;
                 status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(targetBlend.mode)}, ${Math.round(targetBlend.confidence * 100)}%).`;
+                this.rememberAppliedTextureFile(file);
                 return true;
             } else {
                 status.textContent = `Texture "${file.name}" was not applied.`;
@@ -1988,7 +2275,7 @@ class App {
         requestAnimationFrame(this.animate);
         this.timer.update(time);
         const delta = this.timer.getDelta();
-        if (!this.isActive) {
+        if (!this.isActive || !this.rendererReady) {
             return;
         }
 
@@ -2110,7 +2397,9 @@ class App {
 
     private setBrightness(value: number) {
       const safeValue = Math.max(0.1, value);
-      this.renderer.toneMappingExposure = safeValue;
+      if (this.renderer) {
+        this.renderer.toneMappingExposure = safeValue;
+      }
       if (this.ambientLight) this.ambientLight.intensity = 0.48 * safeValue;
       if (this.hemisphereLight) this.hemisphereLight.intensity = 0.62 * safeValue;
       if (this.directionalLight) this.directionalLight.intensity = 1.85 * safeValue;
@@ -2457,10 +2746,11 @@ class App {
     }
 }
 
-const app = new App();
+const explorerStore = new ExplorerStateStore();
+const initialState = explorerStore.getState();
+const app = new App(initialState.bmd.rendererBackend);
 const characterScene = new CharacterTestScene();
 const terrainScene = new TerrainScene();
-const explorerStore = new ExplorerStateStore();
 
 characterScene.setActive(false);
 terrainScene.setActive(false);
@@ -2804,7 +3094,6 @@ tabButtons.forEach(btn => {
     });
 });
 
-const initialState = explorerStore.getState();
 app.restoreSessionState(initialState.bmd);
 characterScene.restoreSessionState(initialState.character);
 terrainScene.restoreSessionState(initialState.terrain);
