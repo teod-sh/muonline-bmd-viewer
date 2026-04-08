@@ -12,7 +12,8 @@
       "Bash(find:*)",
       "Bash(npm test:*)",
       "Bash(npm install:*)",
-      "Bash(npx vite build:*)"
+      "Bash(npx vite build:*)",
+      "Bash(xargs grep:*)"
     ],
     "deny": [],
     "ask": []

@@ -308,8 +308,10 @@ export class TerrainScene {
 
     private configureRenderer(renderer: SupportedRenderer) {
         if (!this.containerEl) return;
+        const w = this.containerEl.clientWidth || 1;
+        const h = this.containerEl.clientHeight || 1;
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, TERRAIN_MAX_PIXEL_RATIO));
-        renderer.setSize(this.containerEl.clientWidth, this.containerEl.clientHeight);
+        renderer.setSize(w, h);
         renderer.outputColorSpace = THREE.SRGBColorSpace;
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
         renderer.toneMappingExposure = 1.0;
@@ -527,11 +529,13 @@ export class TerrainScene {
 
         window.addEventListener('resize', () => {
             if (!this.containerEl) return;
-            this.camera.aspect = container.clientWidth / container.clientHeight;
+            const w = container.clientWidth || 1;
+            const h = container.clientHeight || 1;
+            this.camera.aspect = w / h;
             this.camera.updateProjectionMatrix();
             if (this.renderer) {
                 this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, TERRAIN_MAX_PIXEL_RATIO));
-                this.renderer.setSize(container.clientWidth, container.clientHeight);
+                this.renderer.setSize(w, h);
             }
             this.minimapNeedsRedraw = true;
         });
@@ -1285,7 +1289,8 @@ export class TerrainScene {
 
         const backend = this.renderer.backend as { getMaxAnisotropy?: () => number };
         const value = backend.getMaxAnisotropy?.();
-        return typeof value === 'number' && Number.isFinite(value) ? value : 1;
+        // WebGPU spec guarantees 16x anisotropy support; fallback if backend doesn't expose the method.
+        return typeof value === 'number' && Number.isFinite(value) ? value : 16;
     }
 
     private applyTerrainTextureQuality() {
@@ -1441,6 +1446,7 @@ export class TerrainScene {
         }
         this.cameraChangeHandle = requestAnimationFrame(() => {
             this.cameraChangeHandle = null;
+            if (!this.controls) return;
             this.updateCoordinateInputs(this.controls.target.x, this.controls.target.z);
             this.onCameraChanged?.(
                 this.toExplorerVector3(this.camera.position),

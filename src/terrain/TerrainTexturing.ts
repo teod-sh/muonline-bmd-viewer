@@ -314,7 +314,7 @@ function sampleMapIndex(data: Uint8Array, x: number, y: number): number {
     return data[clampIndex(y) * TERRAIN_SIZE + clampIndex(x)];
 }
 
-function sampleAtlasNearest(
+function sampleAtlasBilinear(
     atlasPixels: Uint8ClampedArray,
     atlasWidth: number,
     atlasHeight: number,
@@ -334,14 +334,30 @@ function sampleAtlasNearest(
     const localUvY = Math.min(1 - inset, Math.max(inset, tileUvY - Math.floor(tileUvY)));
     const atlasU = (col + localUvX) / atlas.cols;
     const atlasV = (row + localUvY) / atlas.rows;
-    const pixelX = Math.min(atlasWidth - 1, Math.max(0, Math.floor(atlasU * atlasWidth)));
-    const pixelY = Math.min(atlasHeight - 1, Math.max(0, Math.floor(atlasV * atlasHeight)));
-    const offset = (pixelY * atlasWidth + pixelX) * 4;
-    return [
-        atlasPixels[offset],
-        atlasPixels[offset + 1],
-        atlasPixels[offset + 2],
-    ];
+
+    // Bilinear: compute fractional pixel coordinates and sample 4 neighbors
+    const px = atlasU * atlasWidth - 0.5;
+    const py = atlasV * atlasHeight - 0.5;
+    const x0 = Math.max(0, Math.min(atlasWidth - 1, Math.floor(px)));
+    const y0 = Math.max(0, Math.min(atlasHeight - 1, Math.floor(py)));
+    const x1 = Math.min(atlasWidth - 1, x0 + 1);
+    const y1 = Math.min(atlasHeight - 1, y0 + 1);
+    const fx = px - Math.floor(px);
+    const fy = py - Math.floor(py);
+
+    const o00 = (y0 * atlasWidth + x0) * 4;
+    const o10 = (y0 * atlasWidth + x1) * 4;
+    const o01 = (y1 * atlasWidth + x0) * 4;
+    const o11 = (y1 * atlasWidth + x1) * 4;
+
+    const r = (atlasPixels[o00] * (1 - fx) * (1 - fy) + atlasPixels[o10] * fx * (1 - fy) +
+               atlasPixels[o01] * (1 - fx) * fy + atlasPixels[o11] * fx * fy);
+    const g = (atlasPixels[o00 + 1] * (1 - fx) * (1 - fy) + atlasPixels[o10 + 1] * fx * (1 - fy) +
+               atlasPixels[o01 + 1] * (1 - fx) * fy + atlasPixels[o11 + 1] * fx * fy);
+    const b = (atlasPixels[o00 + 2] * (1 - fx) * (1 - fy) + atlasPixels[o10 + 2] * fx * (1 - fy) +
+               atlasPixels[o01 + 2] * (1 - fx) * fy + atlasPixels[o11 + 2] * fx * fy);
+
+    return [Math.round(r), Math.round(g), Math.round(b)];
 }
 
 function createTerrainBakedMaterial(
@@ -414,7 +430,7 @@ function createTerrainBakedMaterial(
 
             const tileUvX = worldTileX * tileUvScale;
             const tileUvY = worldTileY * tileUvScale;
-            const base = sampleAtlasNearest(atlasPixels, atlasWidth, atlasHeight, atlas, idx1, tileUvX, tileUvY);
+            const base = sampleAtlasBilinear(atlasPixels, atlasWidth, atlasHeight, atlas, idx1, tileUvX, tileUvY);
             let r = base[0];
             let g = base[1];
             let b = base[2];
@@ -422,9 +438,9 @@ function createTerrainBakedMaterial(
             const layer2Valid = idx2 < 255 && idx2 < atlas.count;
             const isOpaque = a1 >= (254.5 / 255) && a2 >= (254.5 / 255) && a3 >= (254.5 / 255) && a4 >= (254.5 / 255);
             if (isOpaque && layer2Valid) {
-                [r, g, b] = sampleAtlasNearest(atlasPixels, atlasWidth, atlasHeight, atlas, idx2, tileUvX, tileUvY);
+                [r, g, b] = sampleAtlasBilinear(atlasPixels, atlasWidth, atlasHeight, atlas, idx2, tileUvX, tileUvY);
             } else if (blendAlpha > 0 && layer2Valid) {
-                const overlay = sampleAtlasNearest(atlasPixels, atlasWidth, atlasHeight, atlas, idx2, tileUvX, tileUvY);
+                const overlay = sampleAtlasBilinear(atlasPixels, atlasWidth, atlasHeight, atlas, idx2, tileUvX, tileUvY);
                 r = Math.round(THREE.MathUtils.lerp(r, overlay[0], blendAlpha));
                 g = Math.round(THREE.MathUtils.lerp(g, overlay[1], blendAlpha));
                 b = Math.round(THREE.MathUtils.lerp(b, overlay[2], blendAlpha));
@@ -441,7 +457,7 @@ function createTerrainBakedMaterial(
     bakedContext.putImageData(bakedImage, 0, 0);
 
     const bakedTexture = new THREE.CanvasTexture(bakedCanvas);
-    bakedTexture.colorSpace = THREE.SRGBColorSpace;
+    bakedTexture.colorSpace = THREE.NoColorSpace;
     bakedTexture.wrapS = THREE.ClampToEdgeWrapping;
     bakedTexture.wrapT = THREE.ClampToEdgeWrapping;
     bakedTexture.magFilter = THREE.LinearFilter;
