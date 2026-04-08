@@ -59,6 +59,7 @@ export function createDefaultCharacterSessionState(): CharacterSessionState {
 
 export function createDefaultTerrainSessionState(): TerrainSessionState {
   return {
+    rendererBackend: 'auto',
     lastWorldNumber: null,
     availableWorldNumbers: [],
     cameraPosition: null,
@@ -158,6 +159,9 @@ function mergeTerrainSessionState(raw: unknown): TerrainSessionState {
   const input = safeObject<TerrainSessionState>(raw);
 
   return {
+    rendererBackend: input.rendererBackend === 'webgpu' || input.rendererBackend === 'webgl'
+      ? input.rendererBackend
+      : defaults.rendererBackend,
     lastWorldNumber: typeof input.lastWorldNumber === 'number' ? input.lastWorldNumber : null,
     availableWorldNumbers: Array.isArray(input.availableWorldNumbers)
       ? input.availableWorldNumbers.filter((value): value is number => typeof value === 'number')

@@ -22,6 +22,7 @@ describe('mergeViewerSessionState', () => {
       activeView: 'terrain',
       presentationMode: true,
       terrain: {
+        rendererBackend: 'webgpu',
         lastWorldNumber: 7,
         availableWorldNumbers: [7, 'bad', 8],
         selectedObject: {
@@ -46,6 +47,7 @@ describe('mergeViewerSessionState', () => {
     expect(merged.activeView).toBe('terrain');
     expect(merged.presentationMode).toBe(true);
     expect(merged.terrain.lastWorldNumber).toBe(7);
+    expect(merged.terrain.rendererBackend).toBe('webgpu');
     expect(merged.terrain.availableWorldNumbers).toEqual([7, 8]);
     expect(merged.terrain.selectedObject).toEqual({
       objectId: 'obj-1',

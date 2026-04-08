@@ -1,5 +1,6 @@
 // src/terrain-scene.ts
 import * as THREE from 'three';
+import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { ExplorerBookmark, ExplorerVector3, SelectedWorldObjectRef, TerrainSessionState } from './explorer-types';
 import { createId } from './explorer-store';
@@ -29,6 +30,9 @@ const TERRAIN_OBJECT_CULL_INTERVAL_MS = 120;
 const TERRAIN_CAMERA_MOVE_SPEED = 7000;
 const TERRAIN_CAMERA_SPRINT_MULTIPLIER = 2.2;
 const TERRAIN_MAX_DELTA_SECONDS = 0.1;
+type SupportedRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
+type TerrainRendererBackendPreference = TerrainSessionState['rendererBackend'];
+type TerrainRendererBackendActive = 'webgpu' | 'webgl';
 
 type MovementKeyCode = 'KeyW' | 'KeyA' | 'KeyS' | 'KeyD' | 'ShiftLeft' | 'ShiftRight';
 const MOVEMENT_KEYS: readonly MovementKeyCode[] = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'ShiftRight'];
@@ -39,13 +43,19 @@ export class TerrainScene {
     public onWorldLoaded?: (worldNumber: number, availableWorldNumbers: number[]) => void;
     public onBookmarkCreated?: (bookmark: ExplorerBookmark) => void;
     public onOpenModelRequest?: (selection: SelectedWorldObjectRef, modelFile: File | null) => void;
+    public onStateChanged?: (state: TerrainSessionState) => void;
 
     private scene!: THREE.Scene;
     private camera!: THREE.PerspectiveCamera;
-    private renderer!: THREE.WebGLRenderer;
+    private renderer!: SupportedRenderer;
     private controls!: OrbitControls;
     private timer = new THREE.Timer();
     private isActive = false;
+    private rendererBackendPreference: TerrainRendererBackendPreference = 'auto';
+    private rendererActiveBackend: TerrainRendererBackendActive = 'webgl';
+    private rendererReady = false;
+    private rendererSwapToken = 0;
+    private containerEl: HTMLElement | null = null;
     private ambientLight: THREE.AmbientLight | null = null;
     private sunLight: THREE.DirectionalLight | null = null;
     private objectDrawDistance = TERRAIN_OBJECT_DRAW_DISTANCE_DEFAULT;
@@ -93,6 +103,8 @@ export class TerrainScene {
 
     private statusEl: HTMLElement | null = null;
     private worldSelectEl: HTMLSelectElement | null = null;
+    private rendererBackendSelectEl: HTMLSelectElement | null = null;
+    private rendererBackendStatusEl: HTMLElement | null = null;
     private wireframeEl: HTMLInputElement | null = null;
     private showObjectsEl: HTMLInputElement | null = null;
     private brightnessSliderEl: HTMLInputElement | null = null;
@@ -146,12 +158,19 @@ export class TerrainScene {
         }
     }
 
+    private emitStateChanged() {
+        this.onStateChanged?.(this.getCurrentState());
+    }
+
     public getCurrentState(): TerrainSessionState {
         return {
+            rendererBackend: this.rendererBackendPreference,
             lastWorldNumber: this.loadedWorldNumber,
             availableWorldNumbers: [...this.availableWorldNumbers],
             cameraPosition: this.toExplorerVector3(this.camera.position),
-            cameraTarget: this.toExplorerVector3(this.controls.target),
+            cameraTarget: this.controls
+                ? this.toExplorerVector3(this.controls.target)
+                : { x: 0, y: 0, z: 0 },
             selectedObject: this.selectedObjectRecord?.selection || null,
             wireframe: this.wireframeEl?.checked ?? false,
             showObjects: this.showObjectsEl?.checked ?? true,
@@ -165,6 +184,11 @@ export class TerrainScene {
             ...state,
             availableWorldNumbers: [...state.availableWorldNumbers],
         };
+        this.rendererBackendPreference = state.rendererBackend;
+        if (this.rendererBackendSelectEl) {
+            this.rendererBackendSelectEl.value = state.rendererBackend;
+        }
+        void this.setRendererBackend(state.rendererBackend, { persistState: false, announceStatus: false });
 
         if (this.wireframeEl) {
             this.wireframeEl.checked = state.wireframe;
@@ -263,9 +287,213 @@ export class TerrainScene {
         return true;
     }
 
+    private createClassicWebGLRenderer(): THREE.WebGLRenderer {
+        const renderer = new THREE.WebGLRenderer({
+            antialias: false,
+            powerPreference: 'high-performance',
+        });
+        renderer.debug.checkShaderErrors = false;
+        return renderer;
+    }
+
+    private createPreferredRenderer(preference: TerrainRendererBackendPreference): SupportedRenderer {
+        if (preference === 'webgl') {
+            return this.createClassicWebGLRenderer();
+        }
+
+        return new WebGPURenderer({
+            antialias: false,
+        });
+    }
+
+    private configureRenderer(renderer: SupportedRenderer) {
+        if (!this.containerEl) return;
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, TERRAIN_MAX_PIXEL_RATIO));
+        renderer.setSize(this.containerEl.clientWidth, this.containerEl.clientHeight);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+    }
+
+    private attachControls(domElement: HTMLCanvasElement) {
+        const worldCenter = (TERRAIN_SIZE * TERRAIN_SCALE) / 2;
+        const previousTarget = this.controls?.target.clone() ?? new THREE.Vector3(worldCenter, 0, worldCenter);
+        this.controls = new OrbitControls(this.camera, domElement);
+        this.controls.target.copy(previousTarget);
+        this.controls.enableDamping = true;
+        this.controls.maxDistance = 50000;
+        this.controls.minDistance = 100;
+        this.controls.addEventListener('change', () => {
+            this.scheduleCameraChangedEmit();
+            this.minimapNeedsRedraw = true;
+        });
+    }
+
+    private attachCanvasPointerEvents(domElement: HTMLCanvasElement) {
+        domElement.addEventListener('pointerdown', event => {
+            this.pointerDown = { x: event.clientX, y: event.clientY };
+        });
+        domElement.addEventListener('pointerup', event => {
+            if (!this.pointerDown || event.button !== 0) return;
+            const dx = event.clientX - this.pointerDown.x;
+            const dy = event.clientY - this.pointerDown.y;
+            this.pointerDown = null;
+            if (dx * dx + dy * dy > 25) {
+                return;
+            }
+            this.handleCanvasSelection(event);
+        });
+    }
+
+    private getActiveRendererBackend(renderer: SupportedRenderer): TerrainRendererBackendActive {
+        if (renderer instanceof THREE.WebGLRenderer) {
+            return 'webgl';
+        }
+
+        return (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? 'webgpu' : 'webgl';
+    }
+
+    private updateRendererStatus(message?: string) {
+        if (!this.rendererBackendStatusEl) {
+            return;
+        }
+        if (message) {
+            this.rendererBackendStatusEl.textContent = message;
+            return;
+        }
+
+        const preferred = this.rendererBackendPreference === 'auto'
+            ? 'Auto'
+            : this.rendererBackendPreference === 'webgpu'
+                ? 'WebGPU'
+                : 'WebGL';
+        const active = this.rendererActiveBackend === 'webgpu' ? 'WebGPU' : 'WebGL';
+        this.rendererBackendStatusEl.textContent = `Renderer: ${active} active (preferred: ${preferred})`;
+    }
+
+    private clearWorldScene() {
+        if (this.terrainMesh) {
+            this.scene.remove(this.terrainMesh);
+            this.terrainMesh.geometry.dispose();
+            (this.terrainMesh.material as THREE.Material).dispose();
+            this.terrainMesh = null;
+        }
+        if (this.objectsGroup) {
+            this.scene.remove(this.objectsGroup);
+            this.objectsGroup = null;
+        }
+        this.objectRecords = [];
+        this.selectedObjectRecord = null;
+        this.isolatedObjectRecord = null;
+        this.minimapSourceCanvas = null;
+        this.minimapNeedsRedraw = true;
+        this.updateObjectInspector();
+        this.updateSelectionMarker();
+        this.updateStats(0, 0);
+    }
+
+    private async setRendererBackend(
+        preference: TerrainRendererBackendPreference,
+        options: { persistState?: boolean; announceStatus?: boolean } = {},
+    ) {
+        if (!this.containerEl) return;
+
+        const persistState = options.persistState ?? true;
+        const announceStatus = options.announceStatus ?? true;
+        const currentRenderer = this.renderer;
+        const currentBackend = currentRenderer ? this.getActiveRendererBackend(currentRenderer) : null;
+        const isSameExplicitBackend =
+            preference !== 'auto' &&
+            currentRenderer &&
+            currentBackend === preference &&
+            this.rendererBackendPreference === preference &&
+            this.rendererReady;
+        if (isSameExplicitBackend) {
+            return;
+        }
+
+        const token = ++this.rendererSwapToken;
+        const reloadState = this.loadedWorldNumber !== null ? this.getCurrentState() : null;
+        const worldToReload = reloadState?.lastWorldNumber ?? null;
+        const previousDomElement = currentRenderer?.domElement ?? null;
+
+        this.rendererBackendPreference = preference;
+        if (this.rendererBackendSelectEl && this.rendererBackendSelectEl.value !== preference) {
+            this.rendererBackendSelectEl.value = preference;
+        }
+        this.rendererReady = false;
+        this.updateRendererStatus(`Renderer: switching to ${preference === 'auto' ? 'Auto' : preference}…`);
+
+        if (worldToReload !== null) {
+            this.pendingRestoreState = { ...reloadState!, availableWorldNumbers: [...reloadState!.availableWorldNumbers] };
+            this.clearWorldScene();
+        }
+
+        let renderer = this.createPreferredRenderer(preference);
+        this.configureRenderer(renderer);
+        let fallbackReason: string | null = null;
+
+        if (!(renderer instanceof THREE.WebGLRenderer)) {
+            try {
+                await renderer.init();
+            } catch (error) {
+                fallbackReason = error instanceof Error ? error.message : 'WebGPU initialization failed';
+                renderer.dispose();
+                renderer = this.createClassicWebGLRenderer();
+                this.configureRenderer(renderer);
+            }
+        }
+
+        if (token !== this.rendererSwapToken) {
+            renderer.dispose();
+            return;
+        }
+
+        if (this.controls) {
+            this.controls.dispose();
+        }
+        if (previousDomElement?.parentElement === this.containerEl) {
+            previousDomElement.parentElement.removeChild(previousDomElement);
+        }
+
+        this.containerEl.appendChild(renderer.domElement);
+        this.attachControls(renderer.domElement);
+        this.attachCanvasPointerEvents(renderer.domElement);
+
+        currentRenderer?.dispose();
+        this.renderer = renderer;
+        this.rendererActiveBackend = this.getActiveRendererBackend(renderer);
+        this.setBrightness(parseFloat(this.brightnessSliderEl?.value || `${TERRAIN_BRIGHTNESS_DEFAULT}`) || TERRAIN_BRIGHTNESS_DEFAULT);
+
+        if (worldToReload !== null) {
+            await this.loadWorld(worldToReload);
+        }
+
+        this.rendererReady = true;
+
+        if (announceStatus) {
+            if (fallbackReason) {
+                this.setStatusMessage(`World Viewer WebGPU init failed, using WebGL. ${fallbackReason}`);
+            } else if (preference !== 'webgl') {
+                this.setStatusMessage(`World Viewer renderer: ${this.rendererActiveBackend === 'webgpu' ? 'WebGPU' : 'WebGL fallback'} ready.`);
+            }
+        }
+
+        this.updateRendererStatus(
+            fallbackReason
+                ? `Renderer: WebGL fallback active (${fallbackReason})`
+                : undefined,
+        );
+
+        if (persistState) {
+            this.emitStateChanged();
+        }
+    }
+
     private initThree() {
         const container = document.getElementById('terrain-canvas-container');
         if (!container) return;
+        this.containerEl = container;
 
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x87CEEB);
@@ -274,28 +502,8 @@ export class TerrainScene {
 
         this.camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 10, 100000);
         this.camera.position.set(worldCenter, 5000, worldCenter + 5000);
-
-        this.renderer = new THREE.WebGLRenderer({
-            antialias: false,
-            powerPreference: 'high-performance',
-        });
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, TERRAIN_MAX_PIXEL_RATIO));
-        this.renderer.setSize(container.clientWidth, container.clientHeight);
-        this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        this.renderer.toneMappingExposure = 1.0;
-        container.appendChild(this.renderer.domElement);
         this.timer.connect(document);
-
-        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-        this.controls.target.set(worldCenter, 0, worldCenter);
-        this.controls.enableDamping = true;
-        this.controls.maxDistance = 50000;
-        this.controls.minDistance = 100;
-        this.controls.addEventListener('change', () => {
-            this.scheduleCameraChangedEmit();
-            this.minimapNeedsRedraw = true;
-        });
+        void this.setRendererBackend(this.rendererBackendPreference, { persistState: false, announceStatus: false });
 
         this.ambientLight = new THREE.AmbientLight(0xffffff, TERRAIN_BASE_AMBIENT_INTENSITY);
         this.sunLight = new THREE.DirectionalLight(0xffffff, TERRAIN_BASE_SUN_INTENSITY);
@@ -317,25 +525,14 @@ export class TerrainScene {
         this.selectionMarker.renderOrder = 12;
         this.scene.add(this.selectionMarker);
 
-        this.renderer.domElement.addEventListener('pointerdown', event => {
-            this.pointerDown = { x: event.clientX, y: event.clientY };
-        });
-        this.renderer.domElement.addEventListener('pointerup', event => {
-            if (!this.pointerDown || event.button !== 0) return;
-            const dx = event.clientX - this.pointerDown.x;
-            const dy = event.clientY - this.pointerDown.y;
-            this.pointerDown = null;
-            if (dx * dx + dy * dy > 25) {
-                return;
-            }
-            this.handleCanvasSelection(event);
-        });
-
         window.addEventListener('resize', () => {
-            if (!this.isActive) return;
+            if (!this.containerEl) return;
             this.camera.aspect = container.clientWidth / container.clientHeight;
             this.camera.updateProjectionMatrix();
-            this.renderer.setSize(container.clientWidth, container.clientHeight);
+            if (this.renderer) {
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, TERRAIN_MAX_PIXEL_RATIO));
+                this.renderer.setSize(container.clientWidth, container.clientHeight);
+            }
             this.minimapNeedsRedraw = true;
         });
     }
@@ -345,6 +542,8 @@ export class TerrainScene {
         const folderInput = document.getElementById('terrain-data-folder-input') as HTMLInputElement | null;
         this.statusEl = document.getElementById('terrain-status');
         this.worldSelectEl = document.getElementById('terrain-world-select') as HTMLSelectElement | null;
+        this.rendererBackendSelectEl = document.getElementById('terrain-renderer-backend') as HTMLSelectElement | null;
+        this.rendererBackendStatusEl = document.getElementById('terrain-renderer-status');
         this.wireframeEl = document.getElementById('terrain-wireframe') as HTMLInputElement | null;
         this.showObjectsEl = document.getElementById('terrain-show-objects') as HTMLInputElement | null;
         this.brightnessSliderEl = document.getElementById('terrain-brightness-slider') as HTMLInputElement | null;
@@ -405,19 +604,37 @@ export class TerrainScene {
             }
         });
 
+        if (this.rendererBackendSelectEl) {
+            this.rendererBackendSelectEl.value = this.rendererBackendPreference;
+            this.rendererBackendSelectEl.addEventListener('change', () => {
+                const value = this.rendererBackendSelectEl?.value === 'webgpu' || this.rendererBackendSelectEl?.value === 'webgl'
+                    ? this.rendererBackendSelectEl.value
+                    : 'auto';
+                void this.setRendererBackend(value, { persistState: true });
+            });
+        }
+        this.updateRendererStatus();
+
         this.wireframeEl?.addEventListener('change', () => {
             if (this.terrainMesh) {
-                (this.terrainMesh.material as THREE.ShaderMaterial).wireframe = this.wireframeEl?.checked ?? false;
+                const material = this.terrainMesh.material as THREE.Material & { wireframe?: boolean };
+                if ('wireframe' in material) {
+                    material.wireframe = this.wireframeEl?.checked ?? false;
+                    material.needsUpdate = true;
+                }
             }
+            this.emitStateChanged();
         });
 
         window.addEventListener('keydown', (e) => {
             if (!this.terrainMesh || !this.isActive) return;
             const key = parseInt(e.key, 10);
             if (key >= 0 && key <= 4) {
-                const mat = this.terrainMesh.material as THREE.ShaderMaterial;
-                mat.uniforms.uDebugMode.value = key;
-                console.log(`[TERRAIN] Debug mode: ${key} (0=normal, 1=layer1, 2=layer2, 3=alpha, 4=atlasUV)`);
+                const mat = this.terrainMesh.material;
+                if (mat instanceof THREE.ShaderMaterial) {
+                    mat.uniforms.uDebugMode.value = key;
+                    console.log(`[TERRAIN] Debug mode: ${key} (0=normal, 1=layer1, 2=layer2, 3=alpha, 4=atlasUV)`);
+                }
             }
         });
 
@@ -428,6 +645,7 @@ export class TerrainScene {
                     this.updateObjectDistanceCulling(true);
                 }
             }
+            this.emitStateChanged();
         });
 
         if (this.brightnessSliderEl && this.brightnessLabelEl) {
@@ -435,6 +653,7 @@ export class TerrainScene {
                 const value = parseFloat((e.target as HTMLInputElement).value);
                 this.brightnessLabelEl!.textContent = `Brightness: ${value.toFixed(2)}×`;
                 this.setBrightness(value);
+                this.emitStateChanged();
             });
             const initialBrightness = parseFloat(this.brightnessSliderEl.value) || TERRAIN_BRIGHTNESS_DEFAULT;
             this.brightnessLabelEl.textContent = `Brightness: ${initialBrightness.toFixed(2)}×`;
@@ -447,6 +666,7 @@ export class TerrainScene {
                 this.objectDrawDistance = Math.max(500, value);
                 this.objectDistanceLabelEl!.textContent = `Object Distance: ${Math.round(this.objectDrawDistance)}`;
                 this.updateObjectDistanceCulling(true);
+                this.emitStateChanged();
             });
             const initialDistance = parseFloat(this.objectDistanceSliderEl.value) || TERRAIN_OBJECT_DRAW_DISTANCE_DEFAULT;
             this.objectDrawDistance = Math.max(500, initialDistance);
@@ -501,7 +721,9 @@ export class TerrainScene {
         window.addEventListener('blur', () => this.resetMovementKeys());
 
         this.updateObjectInspector();
-        this.updateCoordinateInputs(this.controls.target.x, this.controls.target.z);
+        if (this.controls) {
+            this.updateCoordinateInputs(this.controls.target.x, this.controls.target.z);
+        }
     }
 
     /** Electron: open native directory dialog and load */
@@ -652,7 +874,9 @@ export class TerrainScene {
         });
 
         try {
-            const result = await this.terrainLoader.load(files);
+            const result = await this.terrainLoader.load(files, {
+                materialMode: this.rendererActiveBackend === 'webgpu' ? 'baked' : 'shader',
+            });
 
             if (this.terrainMesh) {
                 this.scene.remove(this.terrainMesh);
@@ -665,6 +889,7 @@ export class TerrainScene {
 
             this.terrainMesh = result.mesh;
             this.scene.add(this.terrainMesh);
+            this.applyTerrainTextureQuality();
             this.updateStats(this.getTerrainTileCount(result.mesh), result.objectsData?.objects.length ?? 0);
             this.loadedWorldNumber = result.mapNumber;
 
@@ -702,6 +927,7 @@ export class TerrainScene {
             this.updateSelectionMarker();
             this.scheduleCameraChangedEmit();
             this.onWorldLoaded?.(result.mapNumber, [...this.availableWorldNumbers]);
+            this.emitStateChanged();
 
             if (this.statusEl) {
                 const objCount = result.objectsData?.objects.length ?? 0;
@@ -1042,14 +1268,45 @@ export class TerrainScene {
 
     private setBrightness(value: number) {
         const safeValue = Math.max(0.1, value);
-        this.renderer.toneMappingExposure = safeValue;
+        if (this.renderer) {
+            this.renderer.toneMappingExposure = safeValue;
+        }
         if (this.ambientLight) this.ambientLight.intensity = TERRAIN_BASE_AMBIENT_INTENSITY * safeValue;
         if (this.sunLight) this.sunLight.intensity = TERRAIN_BASE_SUN_INTENSITY * safeValue;
     }
 
+    private getRendererMaxAnisotropy(): number {
+        if (!this.renderer) {
+            return 1;
+        }
+        if (this.renderer instanceof THREE.WebGLRenderer) {
+            return this.renderer.capabilities.getMaxAnisotropy();
+        }
+
+        const backend = this.renderer.backend as { getMaxAnisotropy?: () => number };
+        const value = backend.getMaxAnisotropy?.();
+        return typeof value === 'number' && Number.isFinite(value) ? value : 1;
+    }
+
+    private applyTerrainTextureQuality() {
+        if (!this.terrainMesh) return;
+        const material = this.terrainMesh.material as THREE.Material & { map?: THREE.Texture | null };
+        const map = material.map;
+        if (!(map instanceof THREE.Texture)) {
+            return;
+        }
+
+        map.anisotropy = Math.max(1, Math.min(16, this.getRendererMaxAnisotropy()));
+        map.needsUpdate = true;
+    }
+
     private updateTerrainMaterialState() {
         if (this.terrainMesh && this.wireframeEl) {
-            (this.terrainMesh.material as THREE.ShaderMaterial).wireframe = this.wireframeEl.checked;
+            const material = this.terrainMesh.material as THREE.Material & { wireframe?: boolean };
+            if ('wireframe' in material) {
+                material.wireframe = this.wireframeEl.checked;
+                material.needsUpdate = true;
+            }
         }
         if (this.objectsGroup && this.showObjectsEl) {
             this.objectsGroup.visible = this.showObjectsEl.checked;
@@ -1231,7 +1488,7 @@ export class TerrainScene {
 
     private animate = (timestamp?: DOMHighResTimeStamp) => {
         requestAnimationFrame(this.animate);
-        if (!this.isActive) return;
+        if (!this.isActive || !this.rendererReady) return;
 
         this.timer.update(timestamp);
         const delta = Math.min(this.timer.getDelta(), TERRAIN_MAX_DELTA_SECONDS);

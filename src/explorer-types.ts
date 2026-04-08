@@ -88,6 +88,7 @@ export interface CharacterPreset extends CharacterSessionState {
 }
 
 export interface TerrainSessionState {
+  rendererBackend: 'auto' | 'webgpu' | 'webgl';
   lastWorldNumber: number | null;
   availableWorldNumbers: number[];
   cameraPosition: ExplorerVector3 | null;

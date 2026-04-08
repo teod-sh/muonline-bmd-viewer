@@ -488,6 +488,13 @@
 
           <div class="control-section">
             <h3>Viewport</h3>
+            <label for="terrain-renderer-backend" class="field-label">Renderer Backend</label>
+            <select id="terrain-renderer-backend" class="animation-dropdown full-width mb-sm">
+              <option value="auto">Auto (prefer WebGPU)</option>
+              <option value="webgpu">WebGPU</option>
+              <option value="webgl">WebGL</option>
+            </select>
+            <p id="terrain-renderer-status" class="control-note">Renderer: initializing…</p>
             <div class="checkbox-control">
               <label for="terrain-wireframe">Wireframe</label>
               <input type="checkbox" id="terrain-wireframe" class="modern-checkbox">

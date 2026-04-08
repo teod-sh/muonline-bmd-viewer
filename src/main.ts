@@ -3044,6 +3044,9 @@ characterScene.onPresetSaveRequested = preset => {
 terrainScene.onCameraChanged = () => {
     explorerStore.setTerrainState(terrainScene.getCurrentState());
 };
+terrainScene.onStateChanged = state => {
+    explorerStore.setTerrainState(state);
+};
 terrainScene.onObjectSelected = () => {
     explorerStore.setTerrainState(terrainScene.getCurrentState());
 };

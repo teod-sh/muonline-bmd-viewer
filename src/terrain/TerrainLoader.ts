@@ -5,7 +5,7 @@ import { readMAP, type TerrainMappingData } from './formats/MAPReader';
 import { readOZB, type OZBData } from './formats/OZBReader';
 import { readOBJ, type OBJData } from './formats/OBJReader';
 import { buildTerrainGeometry, TERRAIN_SCALE } from './TerrainMesh';
-import { buildTextureAtlas, createTerrainMaterial } from './TerrainTexturing';
+import { buildTextureAtlas, createTerrainMaterial, type TerrainMaterialMode } from './TerrainTexturing';
 import { convertOzjToDataUrl } from '../ozj-loader';
 
 export interface TerrainResult {
@@ -44,7 +44,8 @@ const DEFAULT_TEXTURE_FILES: Record<number, string> = {
 export class TerrainLoader {
     private textureLoader = new THREE.TextureLoader();
 
-    async load(files: Map<string, File>): Promise<TerrainResult> {
+    async load(files: Map<string, File>, options?: { materialMode?: TerrainMaterialMode }): Promise<TerrainResult> {
+        const materialMode = options?.materialMode ?? 'shader';
         // Classify files by type
         const attFile = this.findFile(files, /EncTerrain\d*\.att$/i) ?? this.findFile(files, /\.att$/i);
         const mapFile = this.findFile(files, /EncTerrain\d*\.map$/i) ?? this.findFile(files, /\.map$/i);
@@ -87,7 +88,10 @@ export class TerrainLoader {
         const geometry = buildTerrainGeometry(heightData, attData, lightData);
 
         // Build material
-        const material = createTerrainMaterial(atlas, mapData, !!lightData);
+        const material = createTerrainMaterial(atlas, mapData, !!lightData, materialMode);
+        if (materialMode === 'baked') {
+            atlas.texture.dispose();
+        }
 
         const mesh = new THREE.Mesh(geometry, material);
         mesh.name = 'terrain';
