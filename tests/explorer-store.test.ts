@@ -83,6 +83,41 @@ describe('mergeViewerSessionState', () => {
     expect(merged.recentModels).toEqual(defaults.recentModels);
     expect(merged.characterPresets).toEqual(defaults.characterPresets);
   });
+
+  it('normalizes bookmark selected object vectors and optional fields', () => {
+    const merged = mergeViewerSessionState({
+      bookmarks: [{
+        id: 'bookmark-1',
+        name: 'Spawn',
+        worldNumber: 3,
+        cameraPosition: { x: 1 },
+        cameraTarget: { z: 9 },
+        selectedObject: {
+          objectId: 'tree-1',
+          worldNumber: 3,
+          type: 7,
+          displayName: 'Tree',
+          position: { x: 10, z: 20 },
+          rotation: { y: 45 },
+        },
+      }],
+    });
+
+    expect(merged.bookmarks).toHaveLength(1);
+    expect(merged.bookmarks[0].cameraPosition).toEqual({ x: 1, y: 0, z: 0 });
+    expect(merged.bookmarks[0].cameraTarget).toEqual({ x: 0, y: 0, z: 9 });
+    expect(merged.bookmarks[0].selectedObject).toEqual({
+      objectId: 'tree-1',
+      worldNumber: 3,
+      type: 7,
+      modelName: null,
+      modelFileKey: null,
+      displayName: 'Tree',
+      position: { x: 10, y: 0, z: 20 },
+      rotation: { x: 0, y: 45, z: 0 },
+      scale: 1,
+    });
+  });
 });
 
 describe('ExplorerStateStore', () => {
@@ -136,5 +171,106 @@ describe('ExplorerStateStore', () => {
     const restored = new ExplorerStateStore(storage).getState();
     expect(restored.bookmarks[0].name).toBe('Lorencia Spawn');
     expect(restored.recentBookmarks[0].label).toBe('Lorencia Spawn');
+  });
+
+  it('falls back to defaults when persisted state is invalid json', () => {
+    const storage = new MemoryStorage();
+    storage.setItem('broken-state', '{invalid-json');
+
+    const store = new ExplorerStateStore(storage, 'broken-state');
+
+    expect(store.getState()).toEqual(createDefaultViewerSessionState());
+  });
+
+  it('enforces recent entry limits while keeping newest entries first', () => {
+    const store = new ExplorerStateStore(new MemoryStorage());
+
+    for (let index = 0; index < 12; index += 1) {
+      store.pushRecentWorld({
+        worldNumber: index,
+        label: `World ${index}`,
+        timestamp: index,
+      });
+      store.pushRecentBookmark({
+        bookmarkId: `bookmark-${index}`,
+        label: `Bookmark ${index}`,
+        timestamp: index,
+      });
+      store.pushRecentModel({
+        label: `Model ${index}`,
+        modelFileKey: `model-${index}.bmd`,
+        sourceWorldNumber: index,
+        timestamp: index,
+      });
+    }
+
+    const snapshot = store.getState();
+
+    expect(snapshot.recentWorlds).toHaveLength(8);
+    expect(snapshot.recentWorlds[0].worldNumber).toBe(11);
+    expect(snapshot.recentWorlds.at(-1)?.worldNumber).toBe(4);
+
+    expect(snapshot.recentBookmarks).toHaveLength(10);
+    expect(snapshot.recentBookmarks[0].bookmarkId).toBe('bookmark-11');
+    expect(snapshot.recentBookmarks.at(-1)?.bookmarkId).toBe('bookmark-2');
+
+    expect(snapshot.recentModels).toHaveLength(10);
+    expect(snapshot.recentModels[0].label).toBe('Model 11');
+    expect(snapshot.recentModels.at(-1)?.label).toBe('Model 2');
+  });
+
+  it('sorts character presets by pinned status and name', () => {
+    const store = new ExplorerStateStore(new MemoryStorage());
+
+    store.upsertCharacterPreset({
+      id: 'preset-z',
+      name: 'Zulu',
+      pinned: false,
+      createdAt: 1,
+      updatedAt: 1,
+      ...createDefaultViewerSessionState().character,
+    });
+    store.upsertCharacterPreset({
+      id: 'preset-a',
+      name: 'Alpha',
+      pinned: true,
+      createdAt: 2,
+      updatedAt: 2,
+      ...createDefaultViewerSessionState().character,
+    });
+    store.upsertCharacterPreset({
+      id: 'preset-m',
+      name: 'Mike',
+      pinned: false,
+      createdAt: 3,
+      updatedAt: 3,
+      ...createDefaultViewerSessionState().character,
+    });
+
+    expect(store.getState().characterPresets.map(preset => preset.name)).toEqual([
+      'Alpha',
+      'Mike',
+      'Zulu',
+    ]);
+
+    store.toggleCharacterPresetPinned('preset-z');
+
+    expect(store.getState().characterPresets.map(preset => `${preset.pinned}:${preset.name}`)).toEqual([
+      'true:Alpha',
+      'true:Zulu',
+      'false:Mike',
+    ]);
+  });
+
+  it('returns detached snapshots from getState', () => {
+    const store = new ExplorerStateStore(new MemoryStorage());
+    const snapshot = store.getState();
+
+    snapshot.terrain.availableWorldNumbers.push(99);
+    snapshot.character.equipment.helm = 'mutated';
+
+    const freshSnapshot = store.getState();
+    expect(freshSnapshot.terrain.availableWorldNumbers).toEqual([]);
+    expect(freshSnapshot.character.equipment.helm).toBe('');
   });
 });
