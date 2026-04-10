@@ -1149,27 +1149,64 @@ class App {
         this.loadAndApplyTexture(file);
     }
 
-    private exportToGLB() {
+    private async exportToGLB() {
         if (!this.loadedGroup) {
             alert('Load a BMD model first.');
             return;
         }
-        
+
+        // Deduplicate animation tracks (safety net for ANIMATION_DUPLICATE_TARGETS)
+        const animations = this.loadedGroup.animations.map(clip => {
+            const seen = new Set<string>();
+            const uniqueTracks = clip.tracks.filter(track => {
+                if (seen.has(track.name)) return false;
+                seen.add(track.name);
+                return true;
+            });
+            const deduped = new THREE.AnimationClip(clip.name, clip.duration, uniqueTracks);
+            deduped.userData = clip.userData;
+            return deduped;
+        });
+
+        // Temporarily swap MeshPhongMaterial → MeshStandardMaterial for glTF compliance
+        // (glTF is a PBR format; the exporter only fully supports Standard/Basic materials)
+        const materialSwaps: { mesh: THREE.Mesh; original: THREE.Material }[] = [];
+        this.loadedGroup.traverse(obj => {
+            if ((obj as THREE.Mesh).isMesh) {
+                const mat = (obj as THREE.Mesh).material as THREE.MeshPhongMaterial;
+                if (mat.type === 'MeshPhongMaterial') {
+                    const std = new THREE.MeshStandardMaterial({
+                        color: mat.color,
+                        map: mat.map,
+                        side: mat.side,
+                        transparent: mat.transparent,
+                        opacity: mat.opacity,
+                        alphaTest: mat.alphaTest,
+                        alphaMap: mat.alphaMap,
+                        emissive: mat.emissive,
+                        emissiveMap: mat.emissiveMap,
+                        normalMap: mat.normalMap,
+                        roughness: 0.8,
+                        metalness: 0.0,
+                    });
+                    materialSwaps.push({ mesh: obj as THREE.Mesh, original: mat });
+                    (obj as THREE.Mesh).material = std;
+                }
+            }
+        });
+
         const exporter = new GLTFExporter();
-        
-        // Settings: binary .glb, embed images, include animations
         const options = {
             binary: true,
-            animations: this.loadedGroup.animations,
+            animations,
             embedImages: true,
         };
-        
-        exporter.parse(
-            this.loadedGroup,
-            (result: ArrayBuffer | { [key: string]: any }) => {
+
+        try {
+            const result = await exporter.parseAsync(this.loadedGroup, options);
             const glbBuffer = result as ArrayBuffer;
             const blob = new Blob([glbBuffer], { type: 'model/gltf-binary' });
-        
+
             const nameBase =
                 (this.loadedGroup!.name || 'model').replace(/[^a-z0-9_-]/gi, '_');
             const stamp = new Date()
@@ -1177,21 +1214,25 @@ class App {
                 .replace(/[:T]/g, '')
                 .split('.')[0];
             const fileName = `${nameBase}_${stamp}.glb`;
-        
+
             const link = document.createElement('a');
             link.href = URL.createObjectURL(blob);
             link.download = fileName;
             link.click();
             URL.revokeObjectURL(link.href);
-        
+
             logger.debug(`✔️  Saved ${fileName} (${(blob.size / 1024).toFixed(1)} KB)`);
-            },
-            (error) => {
+        } catch (error) {
             logger.error('❌ GLTFExporter error:', error);
             alert('Error during export. Check the console.');
-            },
-            options
-        );
+        } finally {
+            // Restore original materials and dispose temporaries
+            for (const { mesh, original } of materialSwaps) {
+                const temp = mesh.material as THREE.MeshStandardMaterial;
+                mesh.material = original;
+                temp.dispose();
+            }
+        }
     }
 
     private exportGif() {
@@ -1542,7 +1583,8 @@ class App {
             }
 
             logger.debug('[loadExternalAnimations] Using skeleton with', skeleton.bones.length, 'bones');
-            const clips = this.bmdLoader.loadAnimationsFrom(buffer, skeleton);
+            const bmdBones = this.loadedGroup?.userData.bmdBones as THREE.Bone[] | undefined;
+            const clips = this.bmdLoader.loadAnimationsFrom(buffer, skeleton, bmdBones);
             if (clips.length) {
                 this.loadedGroup.animations = clips;
                 this.setupAnimations(this.loadedGroup);
