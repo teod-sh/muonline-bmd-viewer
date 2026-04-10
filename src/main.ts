@@ -19,6 +19,7 @@ import type {
 import { ExplorerStateStore } from './explorer-store';
 import { CharacterTestScene } from './character-test-scene';
 import { TerrainScene } from './terrain-scene';
+import { initControlMenu } from './control-menu';
 import { SkinnedVertexNormalsHelper } from './helpers/SkinnedVertexNormalsHelper';
 import { Disposer } from './utils/Disposer';
 import { FileValidator, FileValidationError } from './utils/FileValidator';
@@ -605,6 +606,7 @@ class App {
         
         const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
         const speedLabel = document.getElementById('speed-label')!;
+        const speedValue = document.getElementById('speed-value');
         const animationsEnabledCheckbox = document.getElementById('animations-enabled-checkbox') as HTMLInputElement | null;
         this.gifWidthInput  = document.getElementById('gif-width-input')  as HTMLInputElement;
         this.gifHeightInput = document.getElementById('gif-height-input') as HTMLInputElement;
@@ -622,12 +624,18 @@ class App {
         speedSlider.addEventListener('input', (e) => {
             const speed = parseFloat((e.target as HTMLInputElement).value);
             speedLabel.textContent = `Speed: ${speed.toFixed(2)}x`;
+            if (speedValue) {
+                speedValue.textContent = `${speed.toFixed(2)}x`;
+            }
             this.setAnimationSpeed(speed);
             this.emitStateChanged();
         });
         const initialAnimationSpeed = parseFloat(speedSlider.value) || DEFAULT_ANIMATION_PLAYBACK_SPEED;
         speedSlider.value = `${initialAnimationSpeed}`;
         speedLabel.textContent = `Speed: ${initialAnimationSpeed.toFixed(2)}x`;
+        if (speedValue) {
+            speedValue.textContent = `${initialAnimationSpeed.toFixed(2)}x`;
+        }
 
         if (animationsEnabledCheckbox) {
             animationsEnabledCheckbox.checked = this.animationsEnabled;
@@ -1007,14 +1015,21 @@ class App {
 
     private initScaleSlider() {                                                            
         const scaleSlider = document.getElementById('scale-slider') as HTMLInputElement;   
-        const scaleLabel = document.getElementById('scale-label')!;                       
+        const scaleLabel = document.getElementById('scale-label')!;
+        const scaleValue = document.getElementById('scale-value');
                                                                                 
        scaleSlider.addEventListener('input', (e) => {                                     
        const scale = parseFloat((e.target as HTMLInputElement).value);               
         scaleLabel.textContent = `Scale: ${scale.toFixed(2)}x`;                       
+        if (scaleValue) {
+            scaleValue.textContent = `${scale.toFixed(2)}x`;
+        }
        this.setModelScale(scale);                                                     
         });                                                                               
         scaleLabel.textContent = `Scale: ${parseFloat(scaleSlider.value).toFixed(2)}x`;   
+        if (scaleValue) {
+            scaleValue.textContent = `${parseFloat(scaleSlider.value).toFixed(2)}x`;
+        }
         }
 
        private setModelScale(scale: number) {                                                  
@@ -2777,6 +2792,7 @@ const initialState = explorerStore.getState();
 const app = new App(initialState.bmd.rendererBackend);
 const characterScene = new CharacterTestScene();
 const terrainScene = new TerrainScene();
+initControlMenu();
 
 characterScene.setActive(false);
 terrainScene.setActive(false);
