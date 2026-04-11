@@ -11,6 +11,7 @@ import {
     type TerrainObjectLoadResult,
     type TerrainObjectSelectionRecord,
 } from './terrain/TerrainObjects';
+import { updateTerrainObjectSelectionBox } from './terrain/TerrainObjectSelectionBounds';
 import {
     buildHeightMinimapRaster,
     minimapPointToWorld,
@@ -94,6 +95,8 @@ export class TerrainScene {
     private selectedObjectRecord: TerrainObjectSelectionRecord | null = null;
     private isolatedObjectRecord: TerrainObjectSelectionRecord | null = null;
     private selectionMarker: THREE.Mesh | null = null;
+    private selectionBoundingBox = new THREE.Box3();
+    private selectionBoundingBoxHelper: THREE.Box3Helper | null = null;
     private minimapCanvas: HTMLCanvasElement | null = null;
     private minimapContext: CanvasRenderingContext2D | null = null;
     private minimapSourceCanvas: HTMLCanvasElement | null = null;
@@ -558,6 +561,12 @@ export class TerrainScene {
         this.selectionMarker.visible = false;
         this.selectionMarker.renderOrder = 12;
         this.scene.add(this.selectionMarker);
+
+        this.selectionBoundingBoxHelper = new THREE.Box3Helper(this.selectionBoundingBox, 0xffff00);
+        this.selectionBoundingBoxHelper.name = 'terrain_object_bbox_helper';
+        this.selectionBoundingBoxHelper.visible = false;
+        this.selectionBoundingBoxHelper.renderOrder = 13;
+        this.scene.add(this.selectionBoundingBoxHelper);
 
         window.addEventListener('resize', () => {
             if (!this.containerEl) return;
@@ -1144,6 +1153,7 @@ export class TerrainScene {
         if (!this.selectionMarker) return;
         if (!this.selectedObjectRecord || this.presentationMode) {
             this.selectionMarker.visible = false;
+            this.updateSelectionBoundingBoxHelper();
             return;
         }
 
@@ -1152,6 +1162,23 @@ export class TerrainScene {
         this.selectionMarker.position.set(position.x, position.y + 8, position.z);
         const scale = Math.max(90, this.selectedObjectRecord.approximateRadius * 1.35);
         this.selectionMarker.scale.set(scale, scale, scale);
+        this.updateSelectionBoundingBoxHelper();
+    }
+
+    private updateSelectionBoundingBoxHelper() {
+        if (!this.selectionBoundingBoxHelper) return;
+        const record = this.selectedObjectRecord;
+        if (!record || this.presentationMode) {
+            this.selectionBoundingBoxHelper.visible = false;
+            return;
+        }
+
+        this.selectionBoundingBox.makeEmpty();
+        const hasBox = updateTerrainObjectSelectionBox(record, this.selectionBoundingBox);
+        this.selectionBoundingBoxHelper.visible = hasBox;
+        if (hasBox) {
+            this.selectionBoundingBoxHelper.updateMatrixWorld(true);
+        }
     }
 
     private focusSelectedObject() {

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { BMDLoader } from '../bmd-loader';
+import { BMDLoader, convertTgaToDataUrl } from '../bmd-loader';
 import { convertOzjToDataUrl } from '../ozj-loader';
 import type { SelectedWorldObjectRef } from '../explorer-types';
 import { DEFAULT_ANIMATION_PLAYBACK_SPEED } from '../animation-settings';
@@ -13,6 +13,7 @@ import {
     detectBlendModeFromTexture,
     type BlendHeuristicResult,
 } from '../utils/TextureBlendHeuristics';
+import { selectTerrainObjectTextureCandidates } from './TerrainObjectTextureSelection';
 
 export interface TerrainObjectDefinition {
     type: number;
@@ -676,32 +677,55 @@ async function tryApplyTexture(
         return;
     }
 
-    for (const [name, file] of files) {
-        const fBaseRaw = name.split(/[\\/]/).pop()!.replace(/\.[^.]+$/, '');
-        if (normalizeObjectBaseName(fBaseRaw) === cacheKey) {
-            try {
-                const ext = file.name.split('.').pop()!.toLowerCase();
-                let url: string;
-                if (ext === 'ozj' || ext === 'ozt') {
-                    url = await convertOzjToDataUrl(await file.arrayBuffer(), ext as 'ozj' | 'ozt');
-                } else {
-                    url = URL.createObjectURL(file);
-                }
-                const tex = await textureLoader.loadAsync(url);
-                tex.colorSpace = THREE.SRGBColorSpace;
-                tex.wrapS = THREE.RepeatWrapping;
-                tex.wrapT = THREE.RepeatWrapping;
-                tex.flipY = false;
+    const candidates = selectTerrainObjectTextureCandidates(
+        texName,
+        Array.from(files, ([name, file]) => ({ name, file })),
+        candidate => candidate.name,
+    );
 
-                const blendResult = detectBlendModeFromTexture(tex, `${baseNameRaw} ${name}`);
-                tex.userData.blendHeuristic = blendResult;
-                textureCache.set(cacheKey, tex);
-                blendCache.set(cacheKey, blendResult);
-                applyToGroup(tex, blendResult);
-                return;
-            } catch {
-                // Skip and try next texture candidate.
-            }
+    for (const candidate of candidates) {
+        try {
+            const tex = await loadTerrainObjectTextureFile(candidate.file, textureLoader);
+            const blendResult = detectBlendModeFromTexture(tex, `${baseNameRaw} ${candidate.name}`);
+            tex.userData.blendHeuristic = blendResult;
+            textureCache.set(cacheKey, tex);
+            blendCache.set(cacheKey, blendResult);
+            applyToGroup(tex, blendResult);
+            return;
+        } catch {
+            // Skip and try next compatible texture candidate.
+        }
+    }
+}
+
+async function loadTerrainObjectTextureFile(
+    file: File,
+    textureLoader: THREE.TextureLoader,
+): Promise<THREE.Texture> {
+    const ext = file.name.split('.').pop()!.toLowerCase();
+    let url: string;
+    let objectUrl: string | null = null;
+
+    if (ext === 'tga') {
+        url = await convertTgaToDataUrl(await file.arrayBuffer());
+    } else if (ext === 'ozj' || ext === 'ozt') {
+        url = await convertOzjToDataUrl(await file.arrayBuffer());
+    } else {
+        objectUrl = URL.createObjectURL(file);
+        url = objectUrl;
+    }
+
+    try {
+        const tex = await textureLoader.loadAsync(url);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.flipY = false;
+        tex.name = file.name;
+        return tex;
+    } finally {
+        if (objectUrl) {
+            URL.revokeObjectURL(objectUrl);
         }
     }
 }
