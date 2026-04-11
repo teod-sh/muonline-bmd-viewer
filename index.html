@@ -70,6 +70,11 @@
               <input type="file" id="bmd-file-input" accept=".bmd" class="file-input-hidden" />
             </div>
 
+            <div class="drop-zone drop-zone-folder" id="folder-bmd-drop-zone" title="Browse a folder of .bmd models">
+              <p>Drop or select <strong>folder</strong> with .bmd files</p>
+              <input type="file" id="folder-bmd-input" webkitdirectory directory multiple class="file-input-hidden" />
+            </div>
+
             <div class="drop-zone" id="anim-bmd-drop-zone" title="Load External Animations">
               <p>Drop animation <strong>.bmd</strong> (optional)</p>
               <input type="file" id="anim-bmd-file-input" accept=".bmd" class="file-input-hidden" />
@@ -618,6 +623,15 @@
       </button>
 
       <div id="canvas-container"></div>
+
+      <aside id="folder-browser-panel" class="folder-browser-panel">
+        <div class="folder-browser-header">
+          <span class="folder-browser-title">Model Browser</span>
+          <button id="folder-browser-close" class="folder-browser-close" title="Close panel">✕</button>
+        </div>
+        <div id="folder-browser-count" class="folder-browser-count"></div>
+        <div id="folder-browser-list" class="folder-browser-list"></div>
+      </aside>
 
       <div id="animations-container"></div>
 

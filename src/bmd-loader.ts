@@ -274,8 +274,13 @@ export class BMDLoader {
         return this.createAnimations(bmd, bones);
     }
 
-    /** Parse a BMD file and return its data structure */
-    public parse(buffer: ArrayBuffer): BMD {
+    /** Parse a BMD file and return its data structure.
+     *  When `meshesOnly` is true the parser stops after reading mesh geometry,
+     *  skipping actions and bones entirely – much faster for thumbnail generation.
+     *  When `bindPoseOnly` is true the parser reads meshes + only frame 0 of action 0
+     *  per bone (skipping remaining frames/actions), giving correct bind-pose positions
+     *  with minimal overhead. */
+    public parse(buffer: ArrayBuffer, options?: { meshesOnly?: boolean; bindPoseOnly?: boolean }): BMD {
         console.groupCollapsed('parse()');
         console.log(`Buffer size: ${buffer.byteLength} bytes`);
 
@@ -376,6 +381,12 @@ export class BMDLoader {
           });
         }
 
+        if (options?.meshesOnly) {
+            console.log(`Parse completed (meshes only). ${bmd.meshes.length} meshes read.`);
+            console.groupEnd();
+            return bmd;
+        }
+
         for (let a = 0; a < actionCount; a++) {
           const numKeys  = readS16();
           const lockPos  = view.getUint8(off) > 0; off += 1;
@@ -411,6 +422,26 @@ export class BMDLoader {
                 rotation  : [{ x:0, y:0, z:0 }],
                 quaternion: [{ x:0, y:0, z:0, w:1 }]
               });
+              continue;
+            }
+
+            // bindPoseOnly: for action 0 read only key 0 and skip the rest;
+            // for all other actions skip everything (12 bytes/float3 × 2 arrays × keys).
+            if (options?.bindPoseOnly) {
+              if (a === 0) {
+                const pos0 = { x: readF32(), y: readF32(), z: readF32() };
+                off += (keys - 1) * 12;                 // skip remaining position keys
+                const rot0 = { x: readF32(), y: readF32(), z: readF32() };
+                off += (keys - 1) * 12;                 // skip remaining rotation keys
+                const q = bmdAngleToQuaternion(rot0);
+                bone.matrixes.push({
+                  position  : [pos0],
+                  rotation  : [rot0],
+                  quaternion: [{ x:q.x, y:q.y, z:q.z, w:q.w }],
+                });
+              } else {
+                off += keys * 12 * 2;                   // skip positions + rotations
+              }
               continue;
             }
 
@@ -514,6 +545,7 @@ private readStringFromDataView(view: DataView, offset: number, length: number): 
 
             for (let b = 0; b < bmd.bones.length; b++) {
                 const bone = bones[b];
+                if (!bone) continue;
                 const bmdBone = bmd.bones[b];
                 if (bmdBone.isDummy || !bmdBone.matrixes[a]) continue;
 

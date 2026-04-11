@@ -2225,7 +2225,8 @@ export class CharacterTestScene {
     }
 
     try {
-      const clips = this.bmdLoader.loadAnimationsFrom(file.buffer, this.baseSkeleton);
+      const bmdBones = this.characterRoot?.userData.bmdBones as THREE.Bone[] | undefined;
+      const clips = this.bmdLoader.loadAnimationsFrom(file.buffer, this.baseSkeleton, bmdBones);
       this.playerAnimations = clips;
       return clips;
     } catch (error) {

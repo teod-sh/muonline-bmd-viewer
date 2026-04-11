@@ -228,6 +228,7 @@ ipcMain.handle('fs:searchTextures', async (event, startPath, requiredTextures) =
     const basename = path.basename(tex, path.extname(tex)).toLowerCase();
     return basename;
   });
+  const requiredNameSet = new Set(requiredNames);
 
   async function searchDir(dirPath) {
     try {
@@ -246,7 +247,7 @@ ipcMain.handle('fs:searchTextures', async (event, startPath, requiredTextures) =
             const nameWithoutExt = path.basename(lowerName, ext);
 
             // Check if this texture is required
-            if (requiredNames.includes(nameWithoutExt)) {
+            if (requiredNameSet.has(nameWithoutExt)) {
               // Add ALL files with matching base name (not just first one)
               if (!foundTextures[nameWithoutExt]) {
                 foundTextures[nameWithoutExt] = [];

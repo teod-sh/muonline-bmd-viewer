@@ -5,6 +5,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { VertexNormalsHelper } from 'three/examples/jsm/helpers/VertexNormalsHelper.js';
 import { BMDLoader, convertTgaToDataUrl } from './bmd-loader';
+import type { BMD } from './types';
 import { convertOzjToDataUrl } from './ozj-loader';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import GIF from 'gif.js';
@@ -32,6 +33,17 @@ import {
     detectBlendModeFromTexture,
     type BlendHeuristicResult,
 } from './utils/TextureBlendHeuristics';
+import {
+    applyThumbnailVisibilityEntries,
+    getNextVisibleThumbnailIndex,
+    removeThumbnailIndexFromQueue,
+} from './utils/FolderThumbnailQueue';
+import {
+    areTextureExtensionsCompatible,
+    normalizeTextureName,
+    selectPreferredTextureCandidates,
+    selectPreferredTexturePaths,
+} from './utils/TextureMatching';
 import './style.css';
 
 // == View ==
@@ -132,6 +144,21 @@ class App {
     private rendererBackendSelect: HTMLSelectElement | null = null;
     private rendererBackendStatusEl: HTMLElement | null = null;
     private environmentTarget: THREE.WebGLRenderTarget | null = null;
+
+    // Folder browser
+    private folderFiles: File[] = [];
+    private folderTextureFiles: File[] = [];
+    private folderActiveIndex: number | null = null;
+    private thumbnailRenderer: THREE.WebGLRenderer | null = null;
+    private thumbnailMaterial: THREE.MeshPhongMaterial | null = null;
+    private folderPanelEl: HTMLElement | null = null;
+    private thumbnailGenId = 0;
+    private thumbnailCache = new Map<string, string>();
+    private thumbnailTexDataUrlCache = new Map<string, string>();
+    private thumbnailPending = new Set<number>();
+    private thumbnailVisible = new Set<number>();
+    private thumbnailProcessing = false;
+    private folderObserver: IntersectionObserver | null = null;
 
     constructor(initialRendererBackend: RendererBackendPreference = 'auto') {
         logger.debug('%c[App] constructor', 'color:#0f0');
@@ -606,6 +633,8 @@ class App {
 
         const removeTexturesBtn = document.getElementById('remove-textures-btn') as HTMLButtonElement;
         removeTexturesBtn.addEventListener('click', () => this.removeTextures());
+
+        this.initFolderBrowser();
         
         const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
         const speedLabel = document.getElementById('speed-label')!;
@@ -1480,7 +1509,13 @@ class App {
 
             if (textureFiles?.length) {
                 let autoAppliedCount = 0;
-                for (const textureFile of textureFiles) {
+                const matchingTextureFiles = selectPreferredTextureCandidates(
+                    textureFiles,
+                    requiredTextures,
+                    textureFile => textureFile.name,
+                );
+
+                for (const textureFile of matchingTextureFiles) {
                     const applied = await this.loadAndApplyTexture(textureFile, { promptOnUnmatched: false });
                     if (applied) {
                         autoAppliedCount++;
@@ -1504,22 +1539,18 @@ class App {
                     logger.debug('[Electron] Search result:', foundTextures);
 
                     if (foundCount > 0) {
-                        // Count total files (each texture name may have multiple files)
-                        const totalFiles = Object.values(foundTextures).reduce((sum, paths) => sum + paths.length, 0);
-                        logger.debug(`%c[Electron] Found ${foundCount} texture names (${totalFiles} files), loading...`, 'color: #4CAF50');
+                        const texturePaths = selectPreferredTexturePaths(foundTextures, requiredTextures);
+                        logger.debug(`%c[Electron] Found ${foundCount} texture names, loading ${texturePaths.length} preferred files...`, 'color: #4CAF50');
 
-                        // Load each found texture file
-                        for (const [textureName, texturePaths] of Object.entries(foundTextures)) {
-                            for (const texturePath of texturePaths) {
-                                const fileData = await readFileFromPath(texturePath);
-                                if (fileData) {
-                                    const file = createFileFromElectronData(fileData.name, fileData.data);
-                                    await this.loadAndApplyTexture(file, { promptOnUnmatched: false });
-                                }
+                        for (const texturePath of texturePaths) {
+                            const fileData = await readFileFromPath(texturePath);
+                            if (fileData) {
+                                const file = createFileFromElectronData(fileData.name, fileData.data);
+                                await this.loadAndApplyTexture(file, { promptOnUnmatched: false });
                             }
                         }
 
-                        statusEl.textContent = `Loaded: ${group.name} | Auto-loaded ${totalFiles} texture files for ${foundCount} base names`;
+                        statusEl.textContent = `Loaded: ${group.name} | Auto-loaded ${texturePaths.length} texture files for ${foundCount} base names`;
                     } else {
                         statusEl.textContent = `Loaded: ${group.name} | No textures found automatically`;
                     }
@@ -1776,159 +1807,28 @@ class App {
         }
     }
 
-  // Corrected loadAndApplyTexture function in main.ts
-
     private async loadAndApplyTexture(file: File, options?: { promptOnUnmatched?: boolean }): Promise<boolean> {
         if (!this.loadedGroup) {
-        logger.warn('Model not loaded - no textures.');
-        return false;
+            logger.warn('Model not loaded - no textures.');
+            return false;
         }
-    
+
         const status = document.getElementById('status')!;
-        status.textContent = `Loading: ${file.name}…`;
         const promptOnUnmatched = options?.promptOnUnmatched ?? true;
-
-        try {
-        const ext = file.name.split('.').pop()!.toLowerCase();
-        let tex: THREE.Texture;
-    
-        if (ext === 'tga') {
-            tex = await this.textureLoader.loadAsync(
-                    await convertTgaToDataUrl(await file.arrayBuffer()));
-        } else if (ext === 'ozj' || ext === 'ozt') {
-            tex = await this.textureLoader.loadAsync(
-                    await convertOzjToDataUrl(await file.arrayBuffer()));
-        } else {                              // jpg / png
-            const url = URL.createObjectURL(file);
-            tex = await this.textureLoader.loadAsync(url);
-            URL.revokeObjectURL(url);
-        }
-    
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-        tex.flipY = false;
-        tex.name  = file.name;
-        const blendResult = detectBlendModeFromTexture(tex, file.name);
-        tex.userData.blendHeuristic = blendResult;
-        const blendLabel = describeBlendMode(blendResult.mode);
-        const confidenceLabel = Math.round(blendResult.confidence * 100);
-        const blendByHint = new Map<string, BlendHeuristicResult>([
-            [file.name.toLowerCase(), blendResult],
-        ]);
-        const getBlendForHint = (hint: string): BlendHeuristicResult => {
-            const key = hint.toLowerCase();
-            const cached = blendByHint.get(key);
-            if (cached) return cached;
-            const detected = detectBlendModeFromTexture(tex, hint);
-            blendByHint.set(key, detected);
-            return detected;
-        };
-        logger.debug(
-            `[Texture blend] "${file.name}" -> ${blendLabel} (${confidenceLabel}%) ${blendResult.reason}`,
-            { metrics: blendResult.metrics, scores: blendResult.scores },
-        );
-    
-        // allow loading PNG/JPG in place of OZT/OZJ and vice versa
-        const equivExt: Record<string,string[]> = {
-            jpg:  ['ozj', 'jpeg'],
-            jpeg: ['ozj', 'jpg'],
-            ozj:  ['jpg', 'jpeg', 'png'],
-            png:  ['ozj', 'ozt'],
-            tga:  ['ozt', 'png'],
-            ozt:  ['tga', 'png'],
-        };
-
-        const fileName  = file.name.toLowerCase();
-        const fileBase  = fileName.replace(/\.[^.]+$/, '');
-        const fileExt   = fileName.split('.').pop()!;
-
-        function normalizeWanted(path: string): { base:string; ext:string } {
-            const name = path.split(/[\\/]/).pop()!.toLowerCase();
-            const ext  = name.split('.').pop()!;
-            const base = name.replace(/\.[^.]+$/, '');
-            return { base, ext };
-        }
+        const { base: fileBase, ext: fileExt } = normalizeTextureName(file.name);
 
         const meshList: { mesh: THREE.Mesh; path: string; isMatch: boolean }[] = [];
         this.loadedGroup.traverse(obj => {
             if ((obj as THREE.Mesh).isMesh && obj.userData.texturePath) {
                 const wantedPath = obj.userData.texturePath as string;
-                const { base:wantedBase, ext:wantedExt } = normalizeWanted(wantedPath);
-                const extMatch =
-                    wantedExt === fileExt ||
-                    (equivExt[wantedExt]?.includes(fileExt)) ||
-                    (equivExt[fileExt]?.includes(wantedExt));
-                const isMatch = extMatch && wantedBase === fileBase;
+                const { base: wantedBase, ext: wantedExt } = normalizeTextureName(wantedPath);
+                const isMatch = wantedBase === fileBase && areTextureExtensionsCompatible(wantedExt, fileExt);
                 meshList.push({ mesh: obj as THREE.Mesh, path: wantedPath, isMatch });
             }
         });
 
-        if (fileExt === 'ozj' || fileExt === 'ozt') {
-            let applied = false;
-            let firstAppliedResult: BlendHeuristicResult | null = null;
-            meshList.forEach(m => {
-                if (m.isMatch) {
-                    const blendForMesh = getBlendForHint(m.path);
-                    const mat = m.mesh.material as THREE.MeshPhongMaterial;
-                    if (mat.map) {
-                        this.disposeDerivedAlphaTexture(mat.map);
-                        mat.alphaMap = null;
-                    }
-                    if (mat.map) mat.map.dispose();
-                    mat.map = tex;
-                    mat.color.set(0xffffff);
-                    applyBlendModeToMaterial(mat, blendForMesh);
-                    this.rememberMaterialAlphaDefaults(mat);
-                    this.applyBlackKeyThresholdToMaterial(mat);
-                    applied = true;
-                    if (!firstAppliedResult) {
-                        firstAppliedResult = blendForMesh;
-                    }
-                    if (this.exportBtn) this.exportBtn.disabled = false;
-                }
-            });
-
-            if (!applied) {
-                logger.warn(`No matching mesh found for "${file.name}"`);
-            }
-
-            status.textContent = applied
-                ? `Texture "${file.name}" loaded (blend: ${describeBlendMode((firstAppliedResult || blendResult).mode)}, ${Math.round((firstAppliedResult || blendResult).confidence * 100)}%).`
-                : `No matching mesh found for "${file.name}". Check the console.`;
-            if (applied) {
-                this.rememberAppliedTextureFile(file);
-            }
-            return applied;
-        } else {
-            const matchedMeshes = meshList.filter(m => m.isMatch);
-            if (matchedMeshes.length > 0) {
-                matchedMeshes.forEach(match => {
-                    const targetBlend = getBlendForHint(match.path);
-                    const mat = match.mesh.material as THREE.MeshPhongMaterial;
-                    if (mat.map) {
-                        this.disposeDerivedAlphaTexture(mat.map);
-                        mat.alphaMap = null;
-                    }
-                    if (mat.map) mat.map.dispose();
-                    mat.map = tex;
-                    mat.color.set(0xffffff);
-                    applyBlendModeToMaterial(mat, targetBlend);
-                    this.rememberMaterialAlphaDefaults(mat);
-                    this.applyBlackKeyThresholdToMaterial(mat);
-                });
-                if (this.exportBtn) this.exportBtn.disabled = false;
-                const firstBlend = getBlendForHint(matchedMeshes[0].path);
-                status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(firstBlend.mode)}, ${Math.round(firstBlend.confidence * 100)}%).`;
-                this.rememberAppliedTextureFile(file);
-                return true;
-            }
-
-            if (!promptOnUnmatched) {
-                logger.warn(`No matching mesh found for "${file.name}"`);
-                status.textContent = `No matching mesh found for "${file.name}".`;
-                return false;
-            }
-
+        let targets = meshList.filter(m => m.isMatch);
+        if (targets.length === 0 && promptOnUnmatched && fileExt !== 'ozj' && fileExt !== 'ozt') {
             let promptMsg = `Apply texture "${file.name}" to which mesh?\n`;
             meshList.forEach((m, i) => {
                 promptMsg += `${i}: ${m.mesh.name} (needs ${m.path})\n`;
@@ -1936,37 +1836,612 @@ class App {
 
             const choiceStr = window.prompt(promptMsg, '');
             const idx = choiceStr !== null ? parseInt(choiceStr, 10) : NaN;
+            targets = !isNaN(idx) && meshList[idx] ? [meshList[idx]] : [];
+        }
 
-            if (!isNaN(idx) && meshList[idx]) {
-                const target = meshList[idx].mesh;
-                const targetPath = meshList[idx].path;
-                const targetBlend = getBlendForHint(targetPath);
-                const mat = target.material as THREE.MeshPhongMaterial;
-                if (mat.map) {
-                    this.disposeDerivedAlphaTexture(mat.map);
-                    mat.alphaMap = null;
-                }
-                if (mat.map) mat.map.dispose();
-                mat.map = tex;
-                mat.color.set(0xffffff);
-                applyBlendModeToMaterial(mat, targetBlend);
-                this.rememberMaterialAlphaDefaults(mat);
-                this.applyBlackKeyThresholdToMaterial(mat);
-                if (this.exportBtn) this.exportBtn.disabled = false;
-                status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(targetBlend.mode)}, ${Math.round(targetBlend.confidence * 100)}%).`;
-                this.rememberAppliedTextureFile(file);
-                return true;
-            } else {
-                status.textContent = `Texture "${file.name}" was not applied.`;
-                return false;
+        if (targets.length === 0) {
+            logger.warn(`No matching mesh found for "${file.name}"`);
+            status.textContent = promptOnUnmatched
+                ? `Texture "${file.name}" was not applied.`
+                : `No matching mesh found for "${file.name}".`;
+            return false;
+        }
+
+        status.textContent = `Loading: ${file.name}...`;
+
+        try {
+            const tex = await this.loadTextureForViewer(file, fileExt);
+            const blendResult = detectBlendModeFromTexture(tex, file.name);
+            tex.userData.blendHeuristic = blendResult;
+            const blendLabel = describeBlendMode(blendResult.mode);
+            const confidenceLabel = Math.round(blendResult.confidence * 100);
+            const blendByHint = new Map<string, BlendHeuristicResult>([
+                [file.name.toLowerCase(), blendResult],
+            ]);
+            const getBlendForHint = (hint: string): BlendHeuristicResult => {
+                const key = hint.toLowerCase();
+                const cached = blendByHint.get(key);
+                if (cached) return cached;
+                const detected = detectBlendModeFromTexture(tex, hint);
+                blendByHint.set(key, detected);
+                return detected;
+            };
+            logger.debug(
+                `[Texture blend] "${file.name}" -> ${blendLabel} (${confidenceLabel}%) ${blendResult.reason}`,
+                { metrics: blendResult.metrics, scores: blendResult.scores },
+            );
+
+            for (const target of targets) {
+                this.applyLoadedTextureToMesh(target.mesh, tex, getBlendForHint(target.path));
+            }
+
+            if (this.exportBtn) this.exportBtn.disabled = false;
+            const firstBlend = getBlendForHint(targets[0].path);
+            status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(firstBlend.mode)}, ${Math.round(firstBlend.confidence * 100)}%).`;
+            this.rememberAppliedTextureFile(file);
+            return true;
+        } catch (e) {
+            logger.error('Texture load error:', e);
+            status.textContent = `Error: ${(e as Error).message}`;
+            return false;
+        }
+    }
+
+    private async loadTextureForViewer(file: File, ext: string): Promise<THREE.Texture> {
+        let tex: THREE.Texture;
+
+        if (ext === 'tga') {
+            tex = await this.textureLoader.loadAsync(await convertTgaToDataUrl(await file.arrayBuffer()));
+        } else if (ext === 'ozj' || ext === 'ozt') {
+            tex = await this.textureLoader.loadAsync(await convertOzjToDataUrl(await file.arrayBuffer()));
+        } else {
+            const url = URL.createObjectURL(file);
+            try {
+                tex = await this.textureLoader.loadAsync(url);
+            } finally {
+                URL.revokeObjectURL(url);
             }
         }
-    
-        } catch (e) {
-        logger.error('Texture load error:', e);
-        status.textContent = `Error: ${(e as Error).message}`;
-        return false;
+
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        tex.flipY = false;
+        tex.name = file.name;
+        return tex;
+    }
+
+    private applyLoadedTextureToMesh(
+        mesh: THREE.Mesh,
+        texture: THREE.Texture,
+        blendResult: BlendHeuristicResult,
+    ): void {
+        const mat = mesh.material as THREE.MeshPhongMaterial;
+        if (mat.map) {
+            this.disposeDerivedAlphaTexture(mat.map);
+            mat.alphaMap = null;
+            mat.map.dispose();
         }
+
+        mat.map = texture;
+        mat.color.set(0xffffff);
+        applyBlendModeToMaterial(mat, blendResult);
+        this.rememberMaterialAlphaDefaults(mat);
+        this.applyBlackKeyThresholdToMaterial(mat);
+    }
+
+    //----------------------------------------------------------
+    // Folder browser  (lazy-loaded thumbnails via IntersectionObserver)
+    //----------------------------------------------------------
+    private initFolderBrowser() {
+        this.folderPanelEl = document.getElementById('folder-browser-panel');
+
+        const zone = document.getElementById('folder-bmd-drop-zone')!;
+        const input = document.getElementById('folder-bmd-input') as HTMLInputElement;
+        const closeBtn = document.getElementById('folder-browser-close')!;
+
+        zone.addEventListener('click', () => input.click());
+        zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over'); });
+        zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            zone.classList.remove('drag-over');
+            if (e.dataTransfer?.files.length) this.loadFolderFiles(e.dataTransfer.files);
+        });
+        input.addEventListener('change', (e) => {
+            const files = (e.target as HTMLInputElement).files;
+            if (files?.length) this.loadFolderFiles(files);
+            input.value = '';
+        });
+        closeBtn.addEventListener('click', () => this.closeFolderPanel());
+    }
+
+    // -- folder loading --------------------------------------------------
+
+    private loadFolderFiles(files: FileList) {
+        const TEXTURE_EXTS = new Set(['ozj', 'ozt', 'tga', 'png', 'jpg', 'jpeg', 'bmp']);
+        const allFiles = Array.from(files);
+
+        this.folderFiles = allFiles
+            .filter(f => f.name.toLowerCase().endsWith('.bmd'))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        this.folderTextureFiles = allFiles.filter(f => {
+            const ext = f.name.toLowerCase().split('.').pop();
+            return ext && TEXTURE_EXTS.has(ext);
+        });
+
+        if (this.folderFiles.length === 0) return;
+
+        // Invalidate any in-flight thumbnail work from a previous folder
+        ++this.thumbnailGenId;
+        this.thumbnailPending.clear();
+        this.thumbnailVisible.clear();
+        this.thumbnailProcessing = false;
+        this.folderObserver?.disconnect();
+
+        this.folderActiveIndex = null;
+        this.renderFolderPanel();
+        this.openFolderPanel();
+        this.setupFolderObserver();
+    }
+
+    // -- IntersectionObserver for lazy thumbnails -------------------------
+
+    private setupFolderObserver() {
+        const listEl = document.getElementById('folder-browser-list');
+        if (!listEl) return;
+
+        this.folderObserver = new IntersectionObserver((entries) => {
+            const visibilityEntries = entries.map(entry => {
+                const index = parseInt((entry.target as HTMLElement).dataset.index!, 10);
+
+                return {
+                    index,
+                    isVisible: !isNaN(index) && entry.isIntersecting && entry.intersectionRatio > 0,
+                    hasCachedThumbnail: !isNaN(index) && this.hasCachedThumbnail(index),
+                };
+            }).filter(entry => !isNaN(entry.index));
+
+            const update = applyThumbnailVisibilityEntries({
+                visibleIndexes: this.thumbnailVisible,
+                pendingIndexes: this.thumbnailPending,
+            }, visibilityEntries);
+
+            this.thumbnailVisible = update.state.visibleIndexes;
+            this.thumbnailPending = update.state.pendingIndexes;
+
+            for (const entry of visibilityEntries) {
+                if (entry.hasCachedThumbnail) continue;
+                if (entry.isVisible) {
+                    this.applyCardThumbnailLoading(entry.index);
+                } else {
+                    this.applyCardThumbnailPending(entry.index);
+                }
+            }
+
+            for (const idx of update.cachedIndexesToApply) {
+                const key = this.thumbCacheKey(idx);
+                const cached = key ? this.thumbnailCache.get(key) : undefined;
+                if (cached !== undefined) {
+                    this.applyCardThumbnail(idx, cached);
+                }
+            }
+
+            this.kickThumbnailQueue();
+        }, {
+            root: listEl,
+            rootMargin: '0px',
+            threshold: 0,
+        });
+
+        listEl.querySelectorAll('.model-card').forEach(card => {
+            this.folderObserver!.observe(card);
+        });
+    }
+
+    // -- thumbnail render queue -------------------------------------------
+
+    private kickThumbnailQueue() {
+        if (this.thumbnailProcessing || this.thumbnailPending.size === 0) return;
+        this.thumbnailProcessing = true;
+        this.processThumbnailQueue();
+    }
+
+    private async processThumbnailQueue() {
+        const genId = this.thumbnailGenId;
+
+        while (genId === this.thumbnailGenId) {
+            const idx = getNextVisibleThumbnailIndex({
+                visibleIndexes: this.thumbnailVisible,
+                pendingIndexes: this.thumbnailPending,
+            });
+            if (idx === null) break;
+
+            const nextQueue = removeThumbnailIndexFromQueue({
+                visibleIndexes: this.thumbnailVisible,
+                pendingIndexes: this.thumbnailPending,
+            }, idx);
+            this.thumbnailVisible = nextQueue.visibleIndexes;
+            this.thumbnailPending = nextQueue.pendingIndexes;
+
+            const file = this.folderFiles[idx];
+            if (!file) continue;
+
+            const cacheKey = this.thumbCacheKey(idx);
+            if (!cacheKey) continue;
+
+            let thumb: string;
+
+            if (this.thumbnailCache.has(cacheKey)) {
+                thumb = this.thumbnailCache.get(cacheKey)!;
+            } else {
+                if (!this.thumbnailVisible.has(idx)) continue;
+                thumb = await this.generateThumbnail(file);
+                if (genId !== this.thumbnailGenId) break;
+                this.thumbnailCache.set(cacheKey, thumb);
+            }
+
+            if (this.thumbnailVisible.has(idx)) {
+                this.applyCardThumbnail(idx, thumb);
+            } else {
+                this.applyCardThumbnailPending(idx);
+            }
+
+            // Yield to main thread so the UI stays responsive
+            await new Promise<void>(r => setTimeout(r, 0));
+        }
+
+        this.thumbnailProcessing = false;
+        if (genId === this.thumbnailGenId && getNextVisibleThumbnailIndex({
+            visibleIndexes: this.thumbnailVisible,
+            pendingIndexes: this.thumbnailPending,
+        }) !== null) {
+            this.kickThumbnailQueue();
+        }
+    }
+
+    private hasCachedThumbnail(index: number): boolean {
+        const key = this.thumbCacheKey(index);
+        return key !== null && this.thumbnailCache.has(key);
+    }
+
+    private thumbCacheKey(index: number): string | null {
+        const f = this.folderFiles[index];
+        return f ? `${f.name}|${f.size}|${f.lastModified}` : null;
+    }
+
+    // -- lightweight thumbnail renderer -----------------------------------
+
+    private getThumbnailRenderer(): THREE.WebGLRenderer {
+        if (!this.thumbnailRenderer) {
+            this.thumbnailRenderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+            this.thumbnailRenderer.setSize(180, 136);
+            this.thumbnailRenderer.setPixelRatio(1);
+        }
+        return this.thumbnailRenderer;
+    }
+
+    /**
+     * Build a minimal THREE.Group for thumbnail rendering.
+     * Uses bind-pose bone matrices (frame 0, action 0) to bake vertex positions
+     * into world space so the model renders in the correct pose.
+     */
+    private async buildThumbnailGroup(bmd: BMD, textureFiles: File[]): Promise<THREE.Group> {
+        if (!this.thumbnailMaterial) {
+            this.thumbnailMaterial = new THREE.MeshPhongMaterial({ color: 0xcccccc, side: THREE.DoubleSide });
+        }
+
+        // --- Compute world-space bone matrices from bind-pose (action 0, key 0) ---
+        const boneWorldMats: THREE.Matrix4[] = [];
+        for (let i = 0; i < bmd.bones.length; i++) {
+            const bone = bmd.bones[i];
+            const local = new THREE.Matrix4();
+            if (!bone.isDummy && bone.matrixes.length > 0) {
+                const m = bone.matrixes[0];
+                const p = m.position[0];
+                const q = m.quaternion[0];
+                local.compose(
+                    new THREE.Vector3(p.x, p.y, p.z),
+                    new THREE.Quaternion(q.x, q.y, q.z, q.w),
+                    new THREE.Vector3(1, 1, 1),
+                );
+            }
+            const parentIdx = bone.parent;
+            if (parentIdx >= 0 && parentIdx < boneWorldMats.length) {
+                local.premultiply(boneWorldMats[parentIdx]);
+            }
+            boneWorldMats.push(local);
+        }
+
+        // --- Texture lookup: base-name (no ext) → File ---
+        const texByBase = new Map<string, File>();
+        for (const f of textureFiles) {
+            const base = f.name.toLowerCase().replace(/\.[^.]+$/, '');
+            if (!texByBase.has(base)) texByBase.set(base, f);
+        }
+
+        const loader = new THREE.TextureLoader();
+        const group = new THREE.Group();
+        const tmpVec = new THREE.Vector3();
+
+        for (const bmdMesh of bmd.meshes) {
+            const positions: number[] = [];
+            const normals: number[] = [];
+            const uvs: number[] = [];
+
+            for (const tri of bmdMesh.triangles) {
+                const vi = tri.vertexIndex;
+                const ni = tri.normalIndex;
+                const ti = tri.texCoordIndex;
+
+                const push = (v: number, n: number, t: number) => {
+                    if (v < 0 || v >= bmdMesh.vertices.length ||
+                        n < 0 || n >= bmdMesh.normals.length) return;
+                    const vert = bmdMesh.vertices[v];
+                    const norm = bmdMesh.normals[n];
+
+                    // Apply bind-pose bone transform to bake world-space position
+                    const boneMat = boneWorldMats[vert.node];
+                    if (boneMat) {
+                        tmpVec.set(vert.position.x, vert.position.y, vert.position.z)
+                               .applyMatrix4(boneMat);
+                        positions.push(tmpVec.x, tmpVec.y, tmpVec.z);
+                    } else {
+                        positions.push(vert.position.x, vert.position.y, vert.position.z);
+                    }
+
+                    normals.push(norm.normal.x, norm.normal.y, norm.normal.z);
+                    if (t >= 0 && t < bmdMesh.texCoords.length) {
+                        uvs.push(bmdMesh.texCoords[t].u, bmdMesh.texCoords[t].v);
+                    } else {
+                        uvs.push(0, 0);
+                    }
+                };
+
+                push(vi[0], ni[0], ti[0]);
+                push(vi[2], ni[2], ti[2]);
+                push(vi[1], ni[1], ti[1]);
+
+                if (tri.polygon === 4) {
+                    push(vi[0], ni[0], ti[0]);
+                    push(vi[2], ni[2], ti[2]);
+                    push(vi[3], ni[3], ti[3]);
+                }
+            }
+
+            if (positions.length === 0) continue;
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+
+            // Try to find and load a matching texture
+            let material: THREE.MeshPhongMaterial = this.thumbnailMaterial;
+            if (texByBase.size > 0 && bmdMesh.texturePath) {
+                const wantedName = bmdMesh.texturePath.split(/[\\/]/).pop()!.toLowerCase();
+                const wantedBase = wantedName.replace(/\.[^.]+$/, '');
+                const texFile = texByBase.get(wantedBase);
+                if (texFile) {
+                    try {
+                        const cacheKey = texFile.name.toLowerCase();
+                        let dataUrl = this.thumbnailTexDataUrlCache.get(cacheKey);
+                        if (!dataUrl) {
+                            const ext = texFile.name.toLowerCase().split('.').pop()!;
+                            if (ext === 'ozj' || ext === 'ozt') {
+                                dataUrl = await convertOzjToDataUrl(await texFile.arrayBuffer());
+                            } else if (ext === 'tga') {
+                                dataUrl = await convertTgaToDataUrl(await texFile.arrayBuffer());
+                            } else {
+                                dataUrl = URL.createObjectURL(texFile);
+                            }
+                            this.thumbnailTexDataUrlCache.set(cacheKey, dataUrl);
+                        }
+                        const tex = await loader.loadAsync(dataUrl);
+                        tex.colorSpace = THREE.SRGBColorSpace;
+                        tex.flipY = false;
+                        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+                        material = new THREE.MeshPhongMaterial({ map: tex, side: THREE.DoubleSide, transparent: true, alphaTest: 0.05 });
+                    } catch {
+                        // fallback to shared gray material
+                    }
+                }
+            }
+
+            group.add(new THREE.Mesh(geo, material));
+        }
+
+        group.rotation.x = -Math.PI / 2;
+        return group;
+    }
+
+    private async generateThumbnail(file: File): Promise<string> {
+        const renderer = this.getThumbnailRenderer();
+
+        // Reuse a persistent mini-scene (lights survive across calls)
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0c1520);
+        scene.add(new THREE.AmbientLight(0x8899cc, 1.5));
+        const dir = new THREE.DirectionalLight(0xffffff, 3.8);
+        dir.position.set(1.2, 2.2, 1.8);
+        scene.add(dir);
+        const rim = new THREE.DirectionalLight(0x3377bb, 1.1);
+        rim.position.set(-1.2, 0.5, -1);
+        scene.add(rim);
+
+        try {
+            const buffer = await file.arrayBuffer();
+
+            // Suppress console spam from the parser during batch operations
+            const saved = {
+                groupCollapsed: console.groupCollapsed,
+                groupEnd: console.groupEnd,
+                log: console.log,
+                time: console.time,
+                timeEnd: console.timeEnd,
+            };
+            const noop = (() => {}) as (..._args: unknown[]) => void;
+            console.groupCollapsed = noop;
+            console.groupEnd = noop;
+            console.log = noop;
+            console.time = noop;
+            console.timeEnd = noop;
+
+            let bmd: BMD;
+            try {
+                bmd = this.bmdLoader.parse(buffer, { bindPoseOnly: true });
+            } finally {
+                console.groupCollapsed = saved.groupCollapsed;
+                console.groupEnd = saved.groupEnd;
+                console.log = saved.log;
+                console.time = saved.time;
+                console.timeEnd = saved.timeEnd;
+            }
+
+            const group = await this.buildThumbnailGroup(bmd, this.folderTextureFiles);
+            scene.add(group);
+            group.updateWorldMatrix(true, true);
+
+            const box = new THREE.Box3().setFromObject(group);
+            if (box.isEmpty()) throw new Error('empty');
+
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = 44;
+            const dist = (maxDim / 2) / Math.tan((fov / 2) * (Math.PI / 180)) * 1.15;
+
+            const camera = new THREE.PerspectiveCamera(fov, 180 / 136, 0.01, dist * 20);
+            camera.position.set(
+                center.x + dist * 0.38,
+                center.y + dist * 0.32,
+                center.z + dist,
+            );
+            camera.lookAt(center);
+
+            renderer.render(scene, camera);
+            const dataUrl = renderer.domElement.toDataURL('image/jpeg', 0.78);
+
+            // Dispose geometry and per-mesh materials/textures; shared material stays alive
+            group.traverse(obj => {
+                const mesh = obj as THREE.Mesh;
+                if (!mesh.isMesh) return;
+                mesh.geometry.dispose();
+                const mat = mesh.material as THREE.MeshPhongMaterial;
+                if (mat !== this.thumbnailMaterial) {
+                    mat.map?.dispose();
+                    mat.dispose();
+                }
+            });
+
+            return dataUrl;
+        } catch {
+            return '';
+        }
+    }
+
+    // -- panel DOM --------------------------------------------------------
+
+    private renderFolderPanel() {
+        const listEl = document.getElementById('folder-browser-list');
+        const countEl = document.getElementById('folder-browser-count');
+        if (!listEl || !countEl) return;
+
+        countEl.textContent = `${this.folderFiles.length} model${this.folderFiles.length !== 1 ? 's' : ''}`;
+        listEl.innerHTML = '';
+
+        this.folderFiles.forEach((file, i) => {
+            const card = document.createElement('div');
+            card.className = 'model-card' + (i === this.folderActiveIndex ? ' active' : '');
+            card.dataset.index = String(i);
+            const displayName = file.name.replace(/\.bmd$/i, '');
+
+            // Check cache — render thumbnail instantly if available
+            const cacheKey = this.thumbCacheKey(i);
+            const cached = cacheKey ? this.thumbnailCache.get(cacheKey) : undefined;
+
+            if (cached !== undefined) {
+                const thumbContent = cached
+                    ? `<img src="${cached}" alt="${file.name}">`
+                    : '<span class="thumb-placeholder">No preview</span>';
+                card.innerHTML = `
+                    <div class="model-card-thumb">${thumbContent}</div>
+                    <div class="model-card-info">
+                      <div class="model-card-name" title="${file.name}">${displayName}</div>
+                    </div>`;
+            } else {
+                card.innerHTML = `
+                    <div class="model-card-thumb"><span class="thumb-placeholder">Preview on scroll</span></div>
+                    <div class="model-card-info">
+                      <div class="model-card-name" title="${file.name}">${displayName}</div>
+                    </div>`;
+            }
+
+            card.addEventListener('click', () => this.loadFolderItem(i));
+            listEl.appendChild(card);
+        });
+    }
+
+    private applyCardThumbnail(index: number, dataUrl: string) {
+        const listEl = document.getElementById('folder-browser-list');
+        if (!listEl) return;
+        const card = listEl.querySelector<HTMLElement>(`[data-index="${index}"]`);
+        if (!card) return;
+        const thumbEl = card.querySelector<HTMLElement>('.model-card-thumb')!;
+        if (dataUrl) {
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            img.alt = this.folderFiles[index]?.name ?? '';
+            thumbEl.innerHTML = '';
+            thumbEl.appendChild(img);
+        } else {
+            thumbEl.innerHTML = '<span class="thumb-placeholder">No preview</span>';
+        }
+    }
+
+    private applyCardThumbnailLoading(index: number) {
+        const thumbEl = this.getCardThumbnailElement(index);
+        if (!thumbEl || this.hasCachedThumbnail(index)) return;
+        thumbEl.innerHTML = '<div class="thumb-spinner"></div>';
+    }
+
+    private applyCardThumbnailPending(index: number) {
+        const thumbEl = this.getCardThumbnailElement(index);
+        if (!thumbEl || this.hasCachedThumbnail(index)) return;
+        thumbEl.innerHTML = '<span class="thumb-placeholder">Preview on scroll</span>';
+    }
+
+    private getCardThumbnailElement(index: number): HTMLElement | null {
+        const listEl = document.getElementById('folder-browser-list');
+        if (!listEl) return null;
+        const card = listEl.querySelector<HTMLElement>(`[data-index="${index}"]`);
+        return card?.querySelector<HTMLElement>('.model-card-thumb') ?? null;
+    }
+
+    private async loadFolderItem(index: number) {
+        this.folderActiveIndex = index;
+        const listEl = document.getElementById('folder-browser-list');
+        if (listEl) {
+            listEl.querySelectorAll('.model-card').forEach((card, i) => {
+                card.classList.toggle('active', i === index);
+            });
+        }
+        await this.handleBmdFile(this.folderFiles[index], undefined, this.folderTextureFiles);
+    }
+
+    private openFolderPanel() {
+        this.folderPanelEl?.classList.add('open');
+    }
+
+    private closeFolderPanel() {
+        this.folderPanelEl?.classList.remove('open');
+        // Stop any in-flight thumbnail work when panel is closed
+        ++this.thumbnailGenId;
+        this.thumbnailPending.clear();
+        this.thumbnailVisible.clear();
+        this.thumbnailProcessing = false;
+        this.folderObserver?.disconnect();
+        this.thumbnailTexDataUrlCache.clear();
     }
 
     private removeTextures() {
@@ -2632,22 +3107,18 @@ class App {
                 const foundCount = Object.keys(foundTextures).length;
 
                 if (foundCount > 0) {
-                    // Count total files (each texture name may have multiple files)
-                    const totalFiles = Object.values(foundTextures).reduce((sum, paths) => sum + paths.length, 0);
-                    logger.debug(`%c[Electron] Found ${foundCount} texture names (${totalFiles} files) for attachment, loading...`, 'color: #4CAF50');
+                    const texturePaths = selectPreferredTexturePaths(foundTextures, requiredTextures);
+                    logger.debug(`%c[Electron] Found ${foundCount} texture names for attachment, loading ${texturePaths.length} preferred files...`, 'color: #4CAF50');
 
-                    // Load each found texture file
-                    for (const [textureName, texturePaths] of Object.entries(foundTextures)) {
-                        for (const texturePath of texturePaths) {
-                            const fileData = await readFileFromPath(texturePath);
-                            if (fileData) {
-                                const file = createFileFromElectronData(fileData.name, fileData.data);
-                                await this.loadAndApplyTexture(file);
-                            }
+                    for (const texturePath of texturePaths) {
+                        const fileData = await readFileFromPath(texturePath);
+                        if (fileData) {
+                            const file = createFileFromElectronData(fileData.name, fileData.data);
+                            await this.loadAndApplyTexture(file, { promptOnUnmatched: false });
                         }
                     }
 
-                    logger.debug(`%c[Electron] Auto-loaded ${totalFiles} texture files for ${foundCount} base names`, 'color: #4CAF50');
+                    logger.debug(`%c[Electron] Auto-loaded ${texturePaths.length} texture files for ${foundCount} base names`, 'color: #4CAF50');
                 }
             } catch (error) {
                 logger.error('[Electron] Error auto-searching textures for attachment:', error);
