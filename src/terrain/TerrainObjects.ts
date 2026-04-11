@@ -40,6 +40,7 @@ export interface TerrainObjectLoadResult {
 export interface TerrainAnimatedObjectInstance {
     object3D: THREE.Object3D;
     mixer: THREE.AnimationMixer;
+    worldPosition: THREE.Vector3;
 }
 
 // World 1 object type-to-name mapping.
@@ -231,8 +232,6 @@ export async function loadTerrainObjects(
             const { group: template, requiredTextures } = await bmdLoader.load(buf);
             const baseOrientation = template.quaternion.clone();
             const approximateRadius = getTemplateApproximateRadius(template);
-            const hasAnimations = template.animations.length > 0;
-
             // Try to load textures for this object
             for (const texName of requiredTextures) {
                 await tryApplyTexture(template, texName, files, textureLoader, textureCache, blendCache);
@@ -263,11 +262,16 @@ export async function loadTerrainObjects(
                     clone.quaternion.copy(objQuat.multiply(baseOrientation));
                     clone.scale.setScalar(inst.scale);
                     clone.animations = template.animations;
-                    if (!hasAnimations) {
-                        clone.updateMatrix();
-                        clone.matrixAutoUpdate = false;
-                    }
+                    clone.updateMatrix();
+                    clone.matrixAutoUpdate = false;
                     clone.updateMatrixWorld(true);
+
+                    // Pre-compute world-space bounding sphere for frustum culling.
+                    const box = new THREE.Box3().setFromObject(clone);
+                    const bs = new THREE.Sphere();
+                    box.getBoundingSphere(bs);
+                    clone.userData.cullBoundingSphere = bs;
+
                     group.add(clone);
 
                     const record = createSelectionRecord(
@@ -296,6 +300,7 @@ export async function loadTerrainObjects(
                         animatedInstances.push({
                             object3D: clone,
                             mixer,
+                            worldPosition: worldPosition.clone(),
                         });
                     }
                 }

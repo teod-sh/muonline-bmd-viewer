@@ -95,6 +95,7 @@ export interface TerrainSessionState {
   cameraTarget: ExplorerVector3 | null;
   selectedObject: SelectedWorldObjectRef | null;
   animationsEnabled: boolean;
+  sunEnabled: boolean;
   wireframe: boolean;
   showObjects: boolean;
   brightness: number;

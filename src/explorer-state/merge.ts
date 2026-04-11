@@ -86,6 +86,7 @@ function mergeTerrainSessionState(raw: unknown): TerrainSessionState {
       : null,
     selectedObject: mergeSelectedObject(input.selectedObject),
     animationsEnabled: coerceBoolean(input.animationsEnabled, defaults.animationsEnabled),
+    sunEnabled: coerceBoolean(input.sunEnabled, defaults.sunEnabled),
     wireframe: coerceBoolean(input.wireframe, defaults.wireframe),
     showObjects: coerceBoolean(input.showObjects, defaults.showObjects),
     brightness: coerceNumber(input.brightness, defaults.brightness),

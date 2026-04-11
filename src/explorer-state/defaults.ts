@@ -51,6 +51,7 @@ export function createDefaultTerrainSessionState(): TerrainSessionState {
     cameraTarget: null,
     selectedObject: null,
     animationsEnabled: true,
+    sunEnabled: true,
     wireframe: false,
     showObjects: true,
     brightness: 1.5,

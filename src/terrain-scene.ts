@@ -11,7 +11,6 @@ import {
     type TerrainObjectLoadResult,
     type TerrainObjectSelectionRecord,
 } from './terrain/TerrainObjects';
-import { isObjectVisibleInHierarchy } from './terrain/TerrainAnimationUtils';
 import {
     buildHeightMinimapRaster,
     minimapPointToWorld,
@@ -32,6 +31,7 @@ const TERRAIN_BASE_SUN_INTENSITY = 1.0;
 const TERRAIN_MAX_PIXEL_RATIO = 1.5;
 const TERRAIN_BRIGHTNESS_DEFAULT = 1.5;
 const TERRAIN_OBJECT_DRAW_DISTANCE_DEFAULT = 6000;
+const TERRAIN_OBJECT_ANIM_DISTANCE_RATIO = 0.55;
 const TERRAIN_OBJECT_CULL_INTERVAL_MS = 120;
 const TERRAIN_CAMERA_MOVE_SPEED = 7000;
 const TERRAIN_CAMERA_SPRINT_MULTIPLIER = 2.2;
@@ -68,6 +68,9 @@ export class TerrainScene {
     private objectCullLastUpdateMs = 0;
     private readonly tempCullCenter = new THREE.Vector3();
     private readonly tempCullScale = new THREE.Vector3();
+    private readonly frustum = new THREE.Frustum();
+    private readonly projScreenMatrix = new THREE.Matrix4();
+    private readonly tempBoundingSphere = new THREE.Sphere();
     private readonly movementKeys: Record<MovementKeyCode, boolean> = {
         KeyW: false,
         KeyA: false,
@@ -116,6 +119,7 @@ export class TerrainScene {
     private wireframeEl: HTMLInputElement | null = null;
     private showObjectsEl: HTMLInputElement | null = null;
     private animationsEnabledEl: HTMLInputElement | null = null;
+    private sunEnabledEl: HTMLInputElement | null = null;
     private brightnessSliderEl: HTMLInputElement | null = null;
     private brightnessLabelEl: HTMLElement | null = null;
     private objectDistanceSliderEl: HTMLInputElement | null = null;
@@ -182,6 +186,7 @@ export class TerrainScene {
                 : { x: 0, y: 0, z: 0 },
             selectedObject: this.selectedObjectRecord?.selection || null,
             animationsEnabled: this.animationsEnabled,
+            sunEnabled: this.sunEnabledEl?.checked ?? true,
             wireframe: this.wireframeEl?.checked ?? false,
             showObjects: this.showObjectsEl?.checked ?? true,
             brightness: parseFloat(this.brightnessSliderEl?.value || `${TERRAIN_BRIGHTNESS_DEFAULT}`) || TERRAIN_BRIGHTNESS_DEFAULT,
@@ -209,6 +214,12 @@ export class TerrainScene {
         this.animationsEnabled = state.animationsEnabled;
         if (this.animationsEnabledEl) {
             this.animationsEnabledEl.checked = state.animationsEnabled;
+        }
+        if (this.sunEnabledEl) {
+            this.sunEnabledEl.checked = state.sunEnabled;
+        }
+        if (this.sunLight) {
+            this.sunLight.visible = state.sunEnabled;
         }
         if (this.brightnessSliderEl && this.brightnessLabelEl) {
             this.brightnessSliderEl.value = `${state.brightness}`;
@@ -523,9 +534,15 @@ export class TerrainScene {
         void this.setRendererBackend(this.rendererBackendPreference, { persistState: false, announceStatus: false });
 
         this.ambientLight = new THREE.AmbientLight(0xffffff, TERRAIN_BASE_AMBIENT_INTENSITY);
-        this.sunLight = new THREE.DirectionalLight(0xffffff, TERRAIN_BASE_SUN_INTENSITY);
-        this.sunLight.position.set(worldCenter, 10000, worldCenter);
-        this.scene.add(this.ambientLight, this.sunLight);
+        this.sunLight = new THREE.DirectionalLight(0xfff8e0, TERRAIN_BASE_SUN_INTENSITY);
+        const sunAzimuth = worldCenter * 0.65;
+        this.sunLight.position.set(
+            worldCenter - sunAzimuth,
+            worldCenter * 0.65,
+            worldCenter + sunAzimuth * 0.45,
+        );
+        this.sunLight.target.position.set(worldCenter, 0, worldCenter);
+        this.scene.add(this.ambientLight, this.sunLight, this.sunLight.target);
 
         this.selectionMarker = new THREE.Mesh(
             new THREE.RingGeometry(0.7, 1, 48),
@@ -566,6 +583,7 @@ export class TerrainScene {
         this.wireframeEl = document.getElementById('terrain-wireframe') as HTMLInputElement | null;
         this.showObjectsEl = document.getElementById('terrain-show-objects') as HTMLInputElement | null;
         this.animationsEnabledEl = document.getElementById('terrain-animations-enabled') as HTMLInputElement | null;
+        this.sunEnabledEl = document.getElementById('terrain-sun-enabled') as HTMLInputElement | null;
         this.brightnessSliderEl = document.getElementById('terrain-brightness-slider') as HTMLInputElement | null;
         this.brightnessLabelEl = document.getElementById('terrain-brightness-label');
         this.objectDistanceSliderEl = document.getElementById('terrain-object-distance-slider') as HTMLInputElement | null;
@@ -670,6 +688,13 @@ export class TerrainScene {
 
         this.animationsEnabledEl?.addEventListener('change', () => {
             this.animationsEnabled = this.animationsEnabledEl?.checked ?? true;
+            this.emitStateChanged();
+        });
+
+        this.sunEnabledEl?.addEventListener('change', () => {
+            if (this.sunLight) {
+                this.sunLight.visible = this.sunEnabledEl?.checked ?? true;
+            }
             this.emitStateChanged();
         });
 
@@ -1250,14 +1275,14 @@ export class TerrainScene {
             return;
         }
 
-        if (force) {
-            this.objectsGroup.updateMatrixWorld(true);
-        }
+        // Build camera frustum once per cull pass for group-level culling.
+        this.projScreenMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
+        this.frustum.setFromProjectionMatrix(this.projScreenMatrix);
 
         const maxDistance = this.objectDrawDistance;
         const cameraPos = this.camera.position;
         for (const child of this.objectsGroup.children) {
-            child.visible = this.isWithinObjectDistance(child, cameraPos, maxDistance);
+            child.visible = this.isWithinDrawRange(child, cameraPos, maxDistance);
         }
 
         this.objectCullLastUpdateMs = now;
@@ -1268,10 +1293,17 @@ export class TerrainScene {
             return;
         }
 
+        // Skip mixer.update() for objects beyond animation distance — they
+        // stay visible in their current pose but the animation freezes, saving
+        // significant per-frame overhead for distant objects.
+        const animDistSq = (this.objectDrawDistance * TERRAIN_OBJECT_ANIM_DISTANCE_RATIO) ** 2;
+        const cameraPos = this.camera.position;
+
         for (const animatedInstance of this.animatedObjectInstances) {
-            if (!isObjectVisibleInHierarchy(animatedInstance.object3D)) {
-                continue;
-            }
+            // Direct .visible check — parent (objectsGroup) visibility is
+            // already guarded above, so no need to walk the hierarchy.
+            if (!animatedInstance.object3D.visible) continue;
+            if (animatedInstance.worldPosition.distanceToSquared(cameraPos) > animDistSq) continue;
 
             animatedInstance.mixer.update(deltaSeconds);
         }
@@ -1284,27 +1316,47 @@ export class TerrainScene {
         return child === record.object3D;
     }
 
-    private isWithinObjectDistance(object: THREE.Object3D, cameraPos: THREE.Vector3, maxDistance: number): boolean {
-        const mesh = object as THREE.Mesh;
-        const geometry = mesh.geometry as THREE.BufferGeometry | undefined;
+    private isWithinDrawRange(object: THREE.Object3D, cameraPos: THREE.Vector3, maxDistance: number): boolean {
+        let center: THREE.Vector3;
+        let radius: number;
 
-        if (geometry) {
-            if (!geometry.boundingSphere) {
-                geometry.computeBoundingSphere();
-            }
-            const sphere = geometry.boundingSphere;
-            if (sphere) {
-                this.tempCullCenter.copy(sphere.center).applyMatrix4(object.matrixWorld);
-                this.tempCullScale.setFromMatrixScale(object.matrixWorld);
-                const radiusScale = Math.max(this.tempCullScale.x, this.tempCullScale.y, this.tempCullScale.z);
-                const radius = sphere.radius * radiusScale;
-                const maxRange = maxDistance + radius;
-                return this.tempCullCenter.distanceToSquared(cameraPos) <= maxRange * maxRange;
+        // Pre-computed world-space bounding sphere (animated clone Groups).
+        const precomputed = object.userData.cullBoundingSphere as THREE.Sphere | undefined;
+        if (precomputed) {
+            center = precomputed.center;
+            radius = precomputed.radius;
+        } else {
+            // InstancedMesh / regular Mesh with geometry.
+            const geometry = (object as THREE.Mesh).geometry as THREE.BufferGeometry | undefined;
+            if (geometry) {
+                if (!geometry.boundingSphere) geometry.computeBoundingSphere();
+                const sphere = geometry.boundingSphere;
+                if (sphere) {
+                    this.tempCullCenter.copy(sphere.center).applyMatrix4(object.matrixWorld);
+                    this.tempCullScale.setFromMatrixScale(object.matrixWorld);
+                    const radiusScale = Math.max(this.tempCullScale.x, this.tempCullScale.y, this.tempCullScale.z);
+                    center = this.tempCullCenter;
+                    radius = sphere.radius * radiusScale;
+                } else {
+                    object.getWorldPosition(this.tempCullCenter);
+                    center = this.tempCullCenter;
+                    radius = 0;
+                }
+            } else {
+                object.getWorldPosition(this.tempCullCenter);
+                center = this.tempCullCenter;
+                radius = 0;
             }
         }
 
-        object.getWorldPosition(this.tempCullCenter);
-        return this.tempCullCenter.distanceToSquared(cameraPos) <= maxDistance * maxDistance;
+        // Distance check.
+        const maxRange = maxDistance + radius;
+        if (center.distanceToSquared(cameraPos) > maxRange * maxRange) return false;
+
+        // Frustum check — prevents Three.js from traversing into off-screen Groups.
+        this.tempBoundingSphere.center.copy(center);
+        this.tempBoundingSphere.radius = radius;
+        return this.frustum.intersectsSphere(this.tempBoundingSphere);
     }
 
     private setBrightness(value: number) {
