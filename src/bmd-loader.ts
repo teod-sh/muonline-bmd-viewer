@@ -156,42 +156,73 @@ export class BMDLoader {
         const group = new THREE.Group();
         group.name  = bmd.name;
 
-        const bones: THREE.Bone[] = [];
+        // --- Build bones (bmdBones matches BMD file indices) ---
+        const bmdBones: THREE.Bone[] = [];
         bmd.bones.forEach(bmdBone => {
             const bone = new THREE.Bone();
             bone.name = bmdBone.name;
-            bones.push(bone);
+            bmdBones.push(bone);
         });
 
+        // Ensure unique bone names (fixes ANIMATION_DUPLICATE_TARGETS in glTF)
+        const usedNames = new Set<string>();
+        for (const bone of bmdBones) {
+            const baseName = bone.name;
+            if (usedNames.has(bone.name)) {
+                let suffix = 1;
+                while (usedNames.has(`${baseName}_${suffix}`)) suffix++;
+                bone.name = `${baseName}_${suffix}`;
+            }
+            usedNames.add(bone.name);
+        }
+
+        // --- Build parent-child hierarchy ---
         const rootBones: THREE.Bone[] = [];
-        bones.forEach((bone, i) => {
+        bmdBones.forEach((bone, i) => {
             const parentIdx = bmd.bones[i].parent;
-            if (parentIdx >= 0 && parentIdx < bones.length) {
-                bones[parentIdx].add(bone);
+            if (parentIdx >= 0 && parentIdx < bmdBones.length) {
+                bmdBones[parentIdx].add(bone);
             } else {
                 rootBones.push(bone);
             }
         });
-        rootBones.forEach(rootBone => group.add(rootBone));
 
-        const skeleton = new THREE.Skeleton(bones);
+        // Ensure single skeleton root (fixes SKIN_SKELETON_INVALID in glTF).
+        // GLTFExporter uses skeleton.bones[0] as the skeleton root node;
+        // if there are multiple root bones, bones[0] is not a common ancestor
+        // of all joints and the validator rejects it.
+        let skeletonBones: THREE.Bone[];
+        let boneIndexOffset = 0;
+        if (rootBones.length > 1) {
+            const armature = new THREE.Bone();
+            armature.name = 'Armature';
+            rootBones.forEach(rb => armature.add(rb));
+            group.add(armature);
+            skeletonBones = [armature, ...bmdBones];
+            boneIndexOffset = 1;
+        } else {
+            rootBones.forEach(rootBone => group.add(rootBone));
+            skeletonBones = bmdBones;
+        }
+
+        const skeleton = new THREE.Skeleton(skeletonBones);
 
         bmd.meshes.forEach(bmdMesh => {
             const geometry = new THREE.BufferGeometry();
-            
+
             const material = new THREE.MeshPhongMaterial({
                 color: 0xcccccc,
                 side: THREE.DoubleSide,
             });
 
-            const { positions, normals, uvs, skinIndices, skinWeights } = this.extractGeometry(bmdMesh);
+            const { positions, normals, uvs, skinIndices, skinWeights } = this.extractGeometry(bmdMesh, boneIndexOffset);
 
             geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
             geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
             geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
             geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4));
             geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4));
-            
+
             const skinnedMesh = new THREE.SkinnedMesh(geometry, material);
             skinnedMesh.name = `mesh_${group.children.length}`;
             skinnedMesh.userData.texturePath = bmdMesh.texturePath;
@@ -201,18 +232,22 @@ export class BMDLoader {
 
         bmd.bones.forEach((bmdBone, i) => {
             if (bmdBone.isDummy || !bmdBone.matrixes?.length) return;
-          
+
             // frame 0, action 0
             const bind = bmdBone.matrixes[0];
             const p    = bind.position[0] ?? { x:0,y:0,z:0 };
             const q    = bind.quaternion[0] ?? { x:0,y:0,z:0,w:1 };
-          
-            const bone = bones[i];
+
+            const bone = bmdBones[i];
             bone.position.set(p.x, p.y, p.z);
             bone.quaternion.set(q.x, q.y, q.z, q.w);
           });
 
-        const animations = this.createAnimations(bmd, bones);
+        // Store bmdBones on the group so external animation loading can use
+        // the correct index mapping (skipping synthetic Armature root).
+        group.userData.bmdBones = bmdBones;
+
+        const animations = this.createAnimations(bmd, bmdBones);
         if (animations.length > 0) {
             group.animations = animations;
         }
@@ -230,14 +265,22 @@ export class BMDLoader {
      * Load only animations from another BMD file and generate clips for the
      * provided skeleton.
      */
-    public loadAnimationsFrom(buffer: ArrayBuffer, skeleton: THREE.Skeleton | THREE.Bone[]): THREE.AnimationClip[] {
-        const bones = Array.isArray(skeleton) ? skeleton as THREE.Bone[] : skeleton.bones;
+    public loadAnimationsFrom(buffer: ArrayBuffer, skeleton: THREE.Skeleton | THREE.Bone[], bmdBones?: THREE.Bone[]): THREE.AnimationClip[] {
+        // If bmdBones are provided (from group.userData.bmdBones), use them
+        // to keep indices aligned with the BMD file. Otherwise fall back to
+        // the raw skeleton/bone array.
+        const bones = bmdBones ?? (Array.isArray(skeleton) ? skeleton as THREE.Bone[] : skeleton.bones);
         const bmd   = this.parse(buffer);
         return this.createAnimations(bmd, bones);
     }
 
-    /** Parse a BMD file and return its data structure */
-    public parse(buffer: ArrayBuffer): BMD {
+    /** Parse a BMD file and return its data structure.
+     *  When `meshesOnly` is true the parser stops after reading mesh geometry,
+     *  skipping actions and bones entirely – much faster for thumbnail generation.
+     *  When `bindPoseOnly` is true the parser reads meshes + only frame 0 of action 0
+     *  per bone (skipping remaining frames/actions), giving correct bind-pose positions
+     *  with minimal overhead. */
+    public parse(buffer: ArrayBuffer, options?: { meshesOnly?: boolean; bindPoseOnly?: boolean }): BMD {
         console.groupCollapsed('parse()');
         console.log(`Buffer size: ${buffer.byteLength} bytes`);
 
@@ -338,6 +381,12 @@ export class BMDLoader {
           });
         }
 
+        if (options?.meshesOnly) {
+            console.log(`Parse completed (meshes only). ${bmd.meshes.length} meshes read.`);
+            console.groupEnd();
+            return bmd;
+        }
+
         for (let a = 0; a < actionCount; a++) {
           const numKeys  = readS16();
           const lockPos  = view.getUint8(off) > 0; off += 1;
@@ -373,6 +422,26 @@ export class BMDLoader {
                 rotation  : [{ x:0, y:0, z:0 }],
                 quaternion: [{ x:0, y:0, z:0, w:1 }]
               });
+              continue;
+            }
+
+            // bindPoseOnly: for action 0 read only key 0 and skip the rest;
+            // for all other actions skip everything (12 bytes/float3 × 2 arrays × keys).
+            if (options?.bindPoseOnly) {
+              if (a === 0) {
+                const pos0 = { x: readF32(), y: readF32(), z: readF32() };
+                off += (keys - 1) * 12;                 // skip remaining position keys
+                const rot0 = { x: readF32(), y: readF32(), z: readF32() };
+                off += (keys - 1) * 12;                 // skip remaining rotation keys
+                const q = bmdAngleToQuaternion(rot0);
+                bone.matrixes.push({
+                  position  : [pos0],
+                  rotation  : [rot0],
+                  quaternion: [{ x:q.x, y:q.y, z:q.z, w:q.w }],
+                });
+              } else {
+                off += keys * 12 * 2;                   // skip positions + rotations
+              }
               continue;
             }
 
@@ -418,7 +487,7 @@ private readStringFromDataView(view: DataView, offset: number, length: number): 
   );
 }
 
-    private extractGeometry(bmdMesh: BMDTextureMesh) {
+    private extractGeometry(bmdMesh: BMDTextureMesh, boneIndexOffset: number = 0) {
         const positions: number[] = [];
         const normals: number[] = [];
         const uvs: number[] = [];
@@ -439,7 +508,7 @@ private readStringFromDataView(view: DataView, offset: number, length: number): 
             normals.push(n.normal.x, n.normal.y, n.normal.z);
             uvs.push(t.u, t.v);
 
-            skinIndices.push(v.node, 0, 0, 0);
+            skinIndices.push(v.node + boneIndexOffset, 0, 0, 0);
             skinWeights.push(1, 0, 0, 0);
             return true;
         };
@@ -476,6 +545,7 @@ private readStringFromDataView(view: DataView, offset: number, length: number): 
 
             for (let b = 0; b < bmd.bones.length; b++) {
                 const bone = bones[b];
+                if (!bone) continue;
                 const bmdBone = bmd.bones[b];
                 if (bmdBone.isDummy || !bmdBone.matrixes[a]) continue;
 

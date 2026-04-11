@@ -27,6 +27,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Search for textures in directory and subdirectories
   searchTextures: (startPath, requiredTextures) => ipcRenderer.invoke('fs:searchTextures', startPath, requiredTextures),
 
+  // Read persisted terrain object overrides from app user data
+  readTerrainObjectOverrides: () => ipcRenderer.invoke('fs:readTerrainObjectOverrides'),
+
+  // Write persisted terrain object overrides to app user data
+  writeTerrainObjectOverrides: (data) => ipcRenderer.invoke('fs:writeTerrainObjectOverrides', data),
+
   // Get real file path from File object (for drag & drop)
   getFilePath: (file) => {
     try {

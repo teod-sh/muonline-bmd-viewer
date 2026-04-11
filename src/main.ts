@@ -1,39 +1,69 @@
 // src/main.ts
 import * as THREE from 'three';
+import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { VertexNormalsHelper } from 'three/examples/jsm/helpers/VertexNormalsHelper.js';
 import { BMDLoader, convertTgaToDataUrl } from './bmd-loader';
+import type { BMD } from './types';
 import { convertOzjToDataUrl } from './ozj-loader';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import GIF from 'gif.js';
 import gifWorkerUrl from 'gif.js/dist/gif.worker.js?url';
 import { isElectron, autoSearchTextures, readFileFromPath, createFileFromElectronData, getFilePathFromFile } from './electron-helper';
+import type {
+    BmdSessionState,
+    ExplorerBookmark,
+    RecentModelEntry,
+    ViewerTab,
+} from './explorer-types';
+import { ExplorerStateStore } from './explorer-store';
 import { CharacterTestScene } from './character-test-scene';
 import { TerrainScene } from './terrain-scene';
+import { initControlMenu } from './control-menu';
 import { SkinnedVertexNormalsHelper } from './helpers/SkinnedVertexNormalsHelper';
 import { Disposer } from './utils/Disposer';
 import { FileValidator, FileValidationError } from './utils/FileValidator';
 import { logger } from './utils/Logger';
+import { bakeSkinnedModelForExport } from './utils/SkinnedMeshBaker';
+import { DEFAULT_ANIMATION_PLAYBACK_SPEED } from './animation-settings';
 import {
     applyBlendModeToMaterial,
     describeBlendMode,
     detectBlendModeFromTexture,
     type BlendHeuristicResult,
 } from './utils/TextureBlendHeuristics';
+import {
+    applyThumbnailVisibilityEntries,
+    getNextVisibleThumbnailIndex,
+    removeThumbnailIndexFromQueue,
+} from './utils/FolderThumbnailQueue';
+import {
+    areTextureExtensionsCompatible,
+    normalizeTextureName,
+    selectPreferredTextureCandidates,
+    selectPreferredTexturePaths,
+} from './utils/TextureMatching';
 import './style.css';
 
 // == View ==
 let skeletonHelper: THREE.SkeletonHelper | null = null;
 const showSkeletonEl = document.getElementById('show-skeleton-checkbox') as HTMLInputElement;
 const wireframeEl    = document.getElementById('wireframe-checkbox')    as HTMLInputElement;
+type SupportedRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
+type RendererBackendPreference = BmdSessionState['rendererBackend'];
+type RendererBackendActive = 'webgpu' | 'webgl';
+const MODEL_VIEWER_PIXEL_RATIO_MAX = 2;
 
 class App {
+    public onStateChanged?: (state: BmdSessionState) => void;
+    public onModelLoaded?: (entry: RecentModelEntry) => void;
+
     private scene!: THREE.Scene;
     private camera!: THREE.PerspectiveCamera;
-    private renderer!: THREE.WebGLRenderer;
+    private renderer!: SupportedRenderer;
     private controls!: OrbitControls;
-    private clock: THREE.Clock = new THREE.Clock();
+    private timer: THREE.Timer = new THREE.Timer();
     private ambientLight!: THREE.AmbientLight;
     private hemisphereLight!: THREE.HemisphereLight;
     private directionalLight!: THREE.DirectionalLight;
@@ -43,6 +73,7 @@ class App {
     private gridHelper: THREE.GridHelper | null = null;
     
     private currentAction: THREE.AnimationAction | null = null;
+    private animationsEnabled = true;
 
     // ### CHANGE ### We store the application state
     private bmdFile: File | null = null;
@@ -57,6 +88,7 @@ class App {
     private textureLoader = new THREE.TextureLoader();
     private lastBmdFilePath: string | null = null;  // For Electron auto-texture search
     private lastAttachmentFilePath: string | null = null;  // For Electron auto-texture search (attachments)
+    private appliedTextureFiles = new Map<string, File>();
 
     // ### NEW ### For rotation
     private isAutoRotating = true;
@@ -101,9 +133,36 @@ class App {
     private showNormalsCheckbox!: HTMLInputElement;
     private normalsVisible = false;
     private normalsUpdateCounter = 0;
+    private pendingRecentModelContext: { label: string; modelFileKey: string | null; sourceWorldNumber: number | null } | null = null;
+    private presentationMode = false;
+    private rendererBackendPreference: RendererBackendPreference;
+    private rendererActiveBackend: RendererBackendActive = 'webgl';
+    private rendererReady = false;
+    private rendererSwapToken = 0;
+    private containerEl!: HTMLElement;
+    private resizeHandler: (() => void) | null = null;
+    private rendererBackendSelect: HTMLSelectElement | null = null;
+    private rendererBackendStatusEl: HTMLElement | null = null;
+    private environmentTarget: THREE.WebGLRenderTarget | null = null;
 
-    constructor() {
+    // Folder browser
+    private folderFiles: File[] = [];
+    private folderTextureFiles: File[] = [];
+    private folderActiveIndex: number | null = null;
+    private thumbnailRenderer: THREE.WebGLRenderer | null = null;
+    private thumbnailMaterial: THREE.MeshPhongMaterial | null = null;
+    private folderPanelEl: HTMLElement | null = null;
+    private thumbnailGenId = 0;
+    private thumbnailCache = new Map<string, string>();
+    private thumbnailTexDataUrlCache = new Map<string, string>();
+    private thumbnailPending = new Set<number>();
+    private thumbnailVisible = new Set<number>();
+    private thumbnailProcessing = false;
+    private folderObserver: IntersectionObserver | null = null;
+
+    constructor(initialRendererBackend: RendererBackendPreference = 'auto') {
         logger.debug('%c[App] constructor', 'color:#0f0');
+        this.rendererBackendPreference = initialRendererBackend;
         this.initThree();
         this.initUI();
         this.animate(performance.now());
@@ -111,6 +170,133 @@ class App {
 
     public setActive(active: boolean) {
         this.isActive = active;
+        if (active) {
+            this.timer.reset();
+        }
+    }
+
+    public setStatusMessage(message: string) {
+        const status = document.getElementById('status');
+        if (status) {
+            status.textContent = message;
+        }
+    }
+
+    public applyPresentationMode(enabled: boolean) {
+        this.presentationMode = enabled;
+        if (enabled) {
+            if (skeletonHelper) skeletonHelper.visible = false;
+            if (this.boundingBoxHelper) this.boundingBoxHelper.visible = false;
+            if (this.axesHelper) this.axesHelper.visible = false;
+            this.normalHelpers.forEach(helper => { helper.visible = false; });
+            if (this.gridHelper) this.gridHelper.visible = false;
+        } else {
+            if (skeletonHelper) skeletonHelper.visible = showSkeletonEl.checked;
+            this.updateBoundingBoxHelperState();
+            this.updateAxesHelperState();
+            this.updateNormalsHelpersState();
+            if (this.gridHelper) this.gridHelper.visible = true;
+        }
+    }
+
+    public getCurrentState(): BmdSessionState {
+        const bgInput = document.getElementById('bg-color-input') as HTMLInputElement | null;
+        const brightnessSlider = document.getElementById('brightness-slider') as HTMLInputElement | null;
+        return {
+            rendererBackend: this.rendererBackendPreference,
+            animationsEnabled: this.animationsEnabled,
+            autoRotate: this.isAutoRotating,
+            showSkeleton: showSkeletonEl.checked,
+            wireframe: wireframeEl.checked,
+            showBoundingBox: this.showBoundingBoxCheckbox?.checked ?? false,
+            showAxes: this.showAxesCheckbox?.checked ?? false,
+            showNormals: this.showNormalsCheckbox?.checked ?? false,
+            backgroundColor: bgInput?.value || '#0b1322',
+            brightness: parseFloat(brightnessSlider?.value || '2') || 2,
+            lastModelName: this.bmdFile?.name || null,
+        };
+    }
+
+    public restoreSessionState(state: BmdSessionState) {
+        const bgInput = document.getElementById('bg-color-input') as HTMLInputElement | null;
+        const brightnessSlider = document.getElementById('brightness-slider') as HTMLInputElement | null;
+        const brightnessLabel = document.getElementById('brightness-label');
+        const autoRotateCheckbox = document.getElementById('auto-rotate-checkbox') as HTMLInputElement | null;
+        const animationsEnabledCheckbox = document.getElementById('animations-enabled-checkbox') as HTMLInputElement | null;
+        const backendSelect = this.rendererBackendSelect;
+
+        if (backendSelect) {
+            backendSelect.value = state.rendererBackend;
+        }
+        if (state.rendererBackend !== this.rendererBackendPreference) {
+            void this.setRendererBackend(state.rendererBackend, { persistState: false });
+        }
+
+        if (autoRotateCheckbox) {
+            autoRotateCheckbox.checked = state.autoRotate;
+            this.isAutoRotating = state.autoRotate;
+        }
+        this.animationsEnabled = state.animationsEnabled;
+        if (animationsEnabledCheckbox) {
+            animationsEnabledCheckbox.checked = state.animationsEnabled;
+        }
+        if (this.currentAction) {
+            this.currentAction.paused = !this.animationsEnabled;
+        }
+        showSkeletonEl.checked = state.showSkeleton;
+        wireframeEl.checked = state.wireframe;
+        if (this.showBoundingBoxCheckbox) this.showBoundingBoxCheckbox.checked = state.showBoundingBox;
+        if (this.showAxesCheckbox) this.showAxesCheckbox.checked = state.showAxes;
+        if (this.showNormalsCheckbox) this.showNormalsCheckbox.checked = state.showNormals;
+        if (bgInput) {
+            bgInput.value = state.backgroundColor;
+            this.setSceneBackground(state.backgroundColor);
+        }
+        if (brightnessSlider && brightnessLabel) {
+            brightnessSlider.value = `${state.brightness}`;
+            brightnessLabel.textContent = `Brightness: ${state.brightness.toFixed(2)}×`;
+            this.setBrightness(state.brightness);
+        }
+        if (skeletonHelper) skeletonHelper.visible = showSkeletonEl.checked;
+        this.scene.traverse(obj => {
+            if ((obj as THREE.Mesh).isMesh) {
+                const material = (obj as THREE.Mesh).material as THREE.Material;
+                if ('wireframe' in material) {
+                    (material as { wireframe: boolean }).wireframe = wireframeEl.checked;
+                    material.needsUpdate = true;
+                }
+            }
+        });
+        this.updateBoundingBoxHelperState();
+        this.updateAxesHelperState();
+        this.updateNormalsHelpersState();
+        this.emitStateChanged();
+    }
+
+    public async openModelFile(
+        file: File,
+        options?: {
+            filePath?: string | null;
+            label?: string;
+            modelFileKey?: string | null;
+            sourceWorldNumber?: number | null;
+            textureFiles?: File[];
+        },
+    ): Promise<void> {
+        this.pendingRecentModelContext = {
+            label: options?.label || file.name,
+            modelFileKey: options?.modelFileKey ?? null,
+            sourceWorldNumber: options?.sourceWorldNumber ?? null,
+        };
+        await this.handleBmdFile(file, options?.filePath ?? undefined, options?.textureFiles);
+    }
+
+    private rememberAppliedTextureFile(file: File) {
+        this.appliedTextureFiles.set(file.name.toLowerCase(), file);
+    }
+
+    private getAppliedTextureFiles(): File[] {
+        return Array.from(this.appliedTextureFiles.values());
     }
 
     //----------------------------------------------------------
@@ -120,48 +306,16 @@ class App {
         logger.groupDebug('%c[App] initThree()', 'color:#0f0');
         const container = document.getElementById('canvas-container');
         if (!container) throw new Error('#canvas-container not found in HTML!');
+        this.containerEl = container;
 
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x0b1322);
-        this.scene.fog = new THREE.FogExp2(0x0b1322, 0.00125);
 
         this.camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 10000);
         this.camera.position.set(0, 200, 400);
-
-        this.renderer = new THREE.WebGLRenderer({
-            antialias: true,
-            alpha: true,
-            preserveDrawingBuffer: true, // keep frame buffer for GIF capture
-        });
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        this.renderer.toneMappingExposure = 0.95;
-        this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-        this.renderer.setSize(container.clientWidth, container.clientHeight);
-        container.appendChild(this.renderer.domElement);
-
-        const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
-        const environmentScene = new RoomEnvironment();
-        this.scene.environment = pmremGenerator.fromScene(environmentScene).texture;
-        environmentScene.dispose();
-        pmremGenerator.dispose();
-
-        window.addEventListener('resize', () => {
-            this.camera.aspect = container.clientWidth / container.clientHeight;
-            this.camera.updateProjectionMatrix();
-            this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-            this.renderer.setSize(container.clientWidth, container.clientHeight);
-        });
-
-        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-        this.controls.enableDamping = true;
-        this.controls.target.set(0, 90, 0);
-
-        // ### NEW ### Pause rotation during interaction
-        this.controls.addEventListener('start', () => { this.userIsInteracting = true; });
-        this.controls.addEventListener('end', () => { this.userIsInteracting = false; });
+        this.timer.connect(document);
+        this.bindResizeHandler();
+        void this.setRendererBackend(this.rendererBackendPreference, { persistState: false, announceStatus: false });
 
         this.ambientLight = new THREE.AmbientLight(0xcde3ff, 0.42);
         this.hemisphereLight = new THREE.HemisphereLight(0x89d7ff, 0x111a27, 0.52);
@@ -207,6 +361,261 @@ class App {
         logger.groupEnd();
     }
 
+    private bindResizeHandler() {
+        if (this.resizeHandler) {
+            return;
+        }
+
+        this.resizeHandler = () => {
+            this.refreshRendererSize();
+        };
+        window.addEventListener('resize', this.resizeHandler);
+    }
+
+    private refreshRendererSize(renderer: SupportedRenderer | null = this.renderer ?? null) {
+        if (!renderer || !this.containerEl) {
+            return;
+        }
+
+        const width = this.containerEl.clientWidth;
+        const height = this.containerEl.clientHeight;
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, MODEL_VIEWER_PIXEL_RATIO_MAX));
+        renderer.setSize(width, height);
+    }
+
+    private createClassicWebGLRenderer(): THREE.WebGLRenderer {
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true,
+            preserveDrawingBuffer: true,
+            powerPreference: 'high-performance',
+        });
+        renderer.debug.checkShaderErrors = false;
+        return renderer;
+    }
+
+    private createPreferredRenderer(preference: RendererBackendPreference): SupportedRenderer {
+        if (preference === 'webgl') {
+            return this.createClassicWebGLRenderer();
+        }
+
+        return new WebGPURenderer({
+            antialias: true,
+            alpha: true,
+        });
+    }
+
+    private configureRendererInstance(renderer: SupportedRenderer) {
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.95;
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFShadowMap;
+        this.refreshRendererSize(renderer);
+    }
+
+    private createControls(domElement: HTMLCanvasElement, target?: THREE.Vector3) {
+        this.controls = new OrbitControls(this.camera, domElement);
+        this.controls.enableDamping = true;
+        this.controls.target.copy(target ?? new THREE.Vector3(0, 90, 0));
+        this.controls.addEventListener('start', () => { this.userIsInteracting = true; });
+        this.controls.addEventListener('end', () => { this.userIsInteracting = false; });
+        this.controls.update();
+    }
+
+    private disposeEnvironmentTarget() {
+        if (this.environmentTarget) {
+            this.environmentTarget.dispose();
+            this.environmentTarget = null;
+        }
+        this.scene.environment = null;
+    }
+
+    private updateEnvironmentForRenderer(renderer: SupportedRenderer) {
+        this.disposeEnvironmentTarget();
+        if (!(renderer instanceof THREE.WebGLRenderer)) {
+            return;
+        }
+
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        const environmentScene = new RoomEnvironment();
+        this.environmentTarget = pmremGenerator.fromScene(environmentScene);
+        this.scene.environment = this.environmentTarget.texture;
+        environmentScene.dispose();
+        pmremGenerator.dispose();
+    }
+
+    private getActiveRendererBackend(renderer: SupportedRenderer): RendererBackendActive {
+        if (renderer instanceof THREE.WebGLRenderer) {
+            return 'webgl';
+        }
+
+        return (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? 'webgpu' : 'webgl';
+    }
+
+    private updateRendererBackendStatus(message?: string) {
+        if (!this.rendererBackendStatusEl) {
+            return;
+        }
+
+        if (message) {
+            this.rendererBackendStatusEl.textContent = message;
+            return;
+        }
+
+        const preferred = this.rendererBackendPreference === 'auto'
+            ? 'Auto'
+            : this.rendererBackendPreference === 'webgpu'
+                ? 'WebGPU'
+                : 'WebGL';
+        const active = this.rendererActiveBackend === 'webgpu' ? 'WebGPU' : 'WebGL';
+        this.rendererBackendStatusEl.textContent = `Renderer: ${active} active (preferred: ${preferred})`;
+    }
+
+    private async reloadCurrentModelAfterRendererSwitchWithAssets(
+        textureFiles: File[],
+        attachmentFile: File | null,
+        attachmentBoneIndex: number,
+    ) {
+        if (!this.bmdFile) {
+            return;
+        }
+
+        const attachBoneSelect = document.getElementById('attach-bone-select') as HTMLSelectElement | null;
+        const statusEl = document.getElementById('status');
+        if (statusEl) {
+            statusEl.textContent = 'Renderer changed. Rebuilding model resources…';
+        }
+
+        await this.loadAndDisplayModel({
+            textureFiles,
+            suppressRecent: true,
+            skipClear: true,
+        });
+
+        if (attachmentFile) {
+            this.currentAttachmentFile = attachmentFile;
+            if (!Number.isNaN(attachmentBoneIndex) && attachmentBoneIndex >= 0) {
+                await this.loadAttachmentAtBone(attachmentBoneIndex);
+                if (attachBoneSelect) {
+                    attachBoneSelect.value = `${attachmentBoneIndex}`;
+                }
+            } else {
+                await this.setupAttachmentControls();
+            }
+        }
+    }
+
+    private async setRendererBackend(
+        preference: RendererBackendPreference,
+        options: { persistState?: boolean; announceStatus?: boolean } = {},
+    ) {
+        const persistState = options.persistState ?? true;
+        const announceStatus = options.announceStatus ?? true;
+        const currentRenderer = this.renderer;
+        const currentBackend = currentRenderer ? this.getActiveRendererBackend(currentRenderer) : null;
+        const shouldReloadModel = !!currentRenderer && !!this.bmdFile && !!this.loadedGroup;
+        const reloadTextureFiles = shouldReloadModel ? this.getAppliedTextureFiles() : [];
+        const attachmentFile = shouldReloadModel ? this.currentAttachmentFile : null;
+        const attachBoneSelect = document.getElementById('attach-bone-select') as HTMLSelectElement | null;
+        const attachmentBoneIndex = attachBoneSelect ? parseInt(attachBoneSelect.value, 10) : NaN;
+        const isSameExplicitBackend =
+            preference !== 'auto' &&
+            currentRenderer &&
+            currentBackend === preference &&
+            this.rendererBackendPreference === preference &&
+            this.rendererReady;
+
+        if (isSameExplicitBackend) {
+            return;
+        }
+
+        const token = ++this.rendererSwapToken;
+        const previousTarget = this.controls?.target.clone() ?? new THREE.Vector3(0, 90, 0);
+        const previousDomElement = currentRenderer?.domElement ?? null;
+
+        this.rendererBackendPreference = preference;
+        if (this.rendererBackendSelect && this.rendererBackendSelect.value !== preference) {
+            this.rendererBackendSelect.value = preference;
+        }
+
+        this.rendererReady = false;
+        this.userIsInteracting = false;
+        this.updateRendererBackendStatus(`Renderer: switching to ${preference === 'auto' ? 'Auto' : preference}…`);
+
+        if (shouldReloadModel) {
+            this.clearScene();
+            this.loadedGroup = null;
+            this.requiredTextures = [];
+            this.currentAttachment = null;
+            this.currentAttachmentFile = attachmentFile;
+        }
+
+        let renderer = this.createPreferredRenderer(preference);
+        this.configureRendererInstance(renderer);
+
+        let fallbackReason: string | null = null;
+
+        if (!(renderer instanceof THREE.WebGLRenderer)) {
+            try {
+                await renderer.init();
+            } catch (error) {
+                fallbackReason = error instanceof Error ? error.message : 'WebGPU initialization failed';
+                renderer.dispose();
+                renderer = this.createClassicWebGLRenderer();
+                this.configureRendererInstance(renderer);
+            }
+        }
+
+        if (token !== this.rendererSwapToken) {
+            renderer.dispose();
+            return;
+        }
+
+        if (this.controls) {
+            this.controls.dispose();
+        }
+        if (previousDomElement?.parentElement === this.containerEl) {
+            previousDomElement.parentElement.removeChild(previousDomElement);
+        }
+
+        this.containerEl.appendChild(renderer.domElement);
+        this.createControls(renderer.domElement, previousTarget);
+        currentRenderer?.dispose();
+        this.renderer = renderer;
+        this.rendererActiveBackend = this.getActiveRendererBackend(renderer);
+        this.updateEnvironmentForRenderer(renderer);
+        this.setBrightness(parseFloat((document.getElementById('brightness-slider') as HTMLInputElement | null)?.value || '2') || 2);
+        if (shouldReloadModel) {
+            await this.reloadCurrentModelAfterRendererSwitchWithAssets(reloadTextureFiles, attachmentFile, attachmentBoneIndex);
+        }
+        this.rendererReady = true;
+
+        if (announceStatus) {
+            if (fallbackReason) {
+                this.setStatusMessage(`WebGPU init failed, using WebGL. ${fallbackReason}`);
+            } else if (preference !== 'webgl') {
+                this.setStatusMessage(`Renderer backend: ${this.rendererActiveBackend === 'webgpu' ? 'WebGPU' : 'WebGL fallback'} ready.`);
+            }
+        }
+
+        this.updateRendererBackendStatus(
+            fallbackReason
+                ? `Renderer: WebGL fallback active (${fallbackReason})`
+                : undefined,
+        );
+
+        if (persistState) {
+            this.emitStateChanged();
+        }
+    }
+
     //----------------------------------------------------------
     // UI - Modified
     //----------------------------------------------------------
@@ -221,26 +630,70 @@ class App {
         const texInput  = document.getElementById('texture-file-input') as HTMLInputElement;
         this.exportBtn = document.getElementById('export-textures-btn') as HTMLButtonElement;
         this.exportBtn.addEventListener('click', () => this.exportTextures());
+
+        const removeTexturesBtn = document.getElementById('remove-textures-btn') as HTMLButtonElement;
+        removeTexturesBtn.addEventListener('click', () => this.removeTextures());
+
+        this.initFolderBrowser();
         
         const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
         const speedLabel = document.getElementById('speed-label')!;
+        const speedValue = document.getElementById('speed-value');
+        const animationsEnabledCheckbox = document.getElementById('animations-enabled-checkbox') as HTMLInputElement | null;
         this.gifWidthInput  = document.getElementById('gif-width-input')  as HTMLInputElement;
         this.gifHeightInput = document.getElementById('gif-height-input') as HTMLInputElement;
         this.gifDelayInput  = document.getElementById('gif-delay-input')  as HTMLInputElement;
         this.gifFrameMultiplierInput = document.getElementById('gif-frame-multiplier-input') as HTMLInputElement;
+        this.rendererBackendSelect = document.getElementById('renderer-backend-select') as HTMLSelectElement | null;
+        this.rendererBackendStatusEl = document.getElementById('renderer-backend-status');
 
         const exportGifBtn = document.getElementById('export-gif-btn') as HTMLButtonElement;
         exportGifBtn.addEventListener('click', () => this.exportGif());
 
         const exportGlbBtn = document.getElementById('export-glb-btn') as HTMLButtonElement;
         exportGlbBtn.addEventListener('click', () => this.exportToGLB());
+
+        const exportAiGlbBtn = document.getElementById('export-ai-glb-btn') as HTMLButtonElement;
+        exportAiGlbBtn.addEventListener('click', () => this.exportToGLB({ bakeSkinning: true }));
         
         speedSlider.addEventListener('input', (e) => {
             const speed = parseFloat((e.target as HTMLInputElement).value);
             speedLabel.textContent = `Speed: ${speed.toFixed(2)}x`;
+            if (speedValue) {
+                speedValue.textContent = `${speed.toFixed(2)}x`;
+            }
             this.setAnimationSpeed(speed);
+            this.emitStateChanged();
         });
-        speedLabel.textContent = `Speed: ${parseFloat(speedSlider.value).toFixed(2)}x`;
+        const initialAnimationSpeed = parseFloat(speedSlider.value) || DEFAULT_ANIMATION_PLAYBACK_SPEED;
+        speedSlider.value = `${initialAnimationSpeed}`;
+        speedLabel.textContent = `Speed: ${initialAnimationSpeed.toFixed(2)}x`;
+        if (speedValue) {
+            speedValue.textContent = `${initialAnimationSpeed.toFixed(2)}x`;
+        }
+
+        if (animationsEnabledCheckbox) {
+            animationsEnabledCheckbox.checked = this.animationsEnabled;
+            animationsEnabledCheckbox.addEventListener('change', (e) => {
+                this.animationsEnabled = (e.target as HTMLInputElement).checked;
+                if (this.currentAction) {
+                    this.currentAction.paused = !this.animationsEnabled;
+                }
+                this.emitStateChanged();
+            });
+        }
+
+        if (this.rendererBackendSelect) {
+            this.rendererBackendSelect.value = this.rendererBackendPreference;
+            this.rendererBackendSelect.addEventListener('change', () => {
+                const selectedValue = this.rendererBackendSelect?.value;
+                const value: RendererBackendPreference = selectedValue === 'webgpu' || selectedValue === 'webgl'
+                    ? selectedValue
+                    : 'auto';
+                void this.setRendererBackend(value, { persistState: true });
+            });
+        }
+        this.updateRendererBackendStatus();
 
         const status = document.getElementById('status')!;
         status.textContent = 'Waiting for BMD file…';
@@ -251,6 +704,7 @@ class App {
         const autoRotateCheckbox = document.getElementById('auto-rotate-checkbox') as HTMLInputElement;
         autoRotateCheckbox.addEventListener('change', (e) => {
             this.isAutoRotating = (e.target as HTMLInputElement).checked;
+            this.emitStateChanged();
         });
         this.isAutoRotating = autoRotateCheckbox.checked;
 
@@ -259,6 +713,7 @@ class App {
         bgInput.addEventListener('input', e => {
             const c = (e.target as HTMLInputElement).value;
             this.setSceneBackground(c);
+            this.emitStateChanged();
         });
         this.setSceneBackground(bgInput.value || '#0b1322');
 
@@ -269,6 +724,7 @@ class App {
             const v = parseFloat((e.target as HTMLInputElement).value);
             brightLabel.textContent = `Brightness: ${v.toFixed(2)}×`;
             this.setBrightness(v);
+            this.emitStateChanged();
         });
         const initialBrightness = parseFloat(brightSlider.value) || 2.0;
         brightLabel.textContent = `Brightness: ${initialBrightness.toFixed(2)}×`;
@@ -292,6 +748,7 @@ class App {
         this.lockFrameCheckbox.addEventListener('change', () => {
             this.isFrameLocked = this.lockFrameCheckbox.checked;
             if (this.isFrameLocked) this.applyLockedFrame();
+            this.emitStateChanged();
         });
 
         this.lockFrameInput.addEventListener('input', () => {
@@ -524,6 +981,7 @@ class App {
         // === Show / hide skeleton =========================================
         showSkeletonEl.addEventListener('change', () => {
             if (skeletonHelper) skeletonHelper.visible = showSkeletonEl.checked;
+            this.emitStateChanged();
         });
 
         // === Wireframe on/off ===============================================
@@ -538,6 +996,7 @@ class App {
                     }
                 }
             });
+            this.emitStateChanged();
         });
 
         // === Bounding box / axes / normals ================================
@@ -547,14 +1006,17 @@ class App {
 
         this.showBoundingBoxCheckbox.addEventListener('change', () => {
             this.updateBoundingBoxHelperState();
+            this.emitStateChanged();
         });
 
         this.showAxesCheckbox.addEventListener('change', () => {
             this.updateAxesHelperState();
+            this.emitStateChanged();
         });
 
         this.showNormalsCheckbox.addEventListener('change', () => {
             this.updateNormalsHelpersState();
+            this.emitStateChanged();
         });
 
         // === attach model to bone (dropdown + slider) ===============================
@@ -588,14 +1050,21 @@ class App {
 
     private initScaleSlider() {                                                            
         const scaleSlider = document.getElementById('scale-slider') as HTMLInputElement;   
-        const scaleLabel = document.getElementById('scale-label')!;                       
+        const scaleLabel = document.getElementById('scale-label')!;
+        const scaleValue = document.getElementById('scale-value');
                                                                                 
        scaleSlider.addEventListener('input', (e) => {                                     
        const scale = parseFloat((e.target as HTMLInputElement).value);               
         scaleLabel.textContent = `Scale: ${scale.toFixed(2)}x`;                       
+        if (scaleValue) {
+            scaleValue.textContent = `${scale.toFixed(2)}x`;
+        }
        this.setModelScale(scale);                                                     
         });                                                                               
         scaleLabel.textContent = `Scale: ${parseFloat(scaleSlider.value).toFixed(2)}x`;   
+        if (scaleValue) {
+            scaleValue.textContent = `${parseFloat(scaleSlider.value).toFixed(2)}x`;
+        }
         }
 
        private setModelScale(scale: number) {                                                  
@@ -635,6 +1104,8 @@ class App {
                 if (material instanceof THREE.MeshPhongMaterial) {
                     material.shininess = Math.max(material.shininess, 12);
                     material.specular.set(0x2f4869);
+                    this.rememberMaterialAlphaDefaults(material);
+                    this.applyBlackKeyThresholdToMaterial(material);
                 }
 
                 if ('envMapIntensity' in material) {
@@ -674,7 +1145,7 @@ class App {
         this.directionalLight.target.updateMatrixWorld();
     }
     
-    private handleBmdFile = async (file: File, filePath?: string) => {
+    private handleBmdFile = async (file: File, filePath?: string, textureFiles?: File[]) => {
         logger.info(`handleBmdFile("${file.name}")`);
 
         try {
@@ -683,8 +1154,9 @@ class App {
 
             this.bmdFile = file;
             this.lastBmdFilePath = filePath || null;  // Store file path for Electron texture search
+            this.appliedTextureFiles.clear();
             document.querySelector('#bmd-drop-zone p')!.textContent = `Selected: ${file.name}`;
-            this.loadAndDisplayModel();
+            await this.loadAndDisplayModel({ textureFiles });
         } catch (error) {
             if (error instanceof FileValidationError) {
                 alert(`Invalid file: ${error.message}`);
@@ -712,53 +1184,106 @@ class App {
         this.loadAndApplyTexture(file);
     }
 
-    private exportToGLB() {
+    private async exportToGLB(options: { bakeSkinning?: boolean } = {}) {
         if (!this.loadedGroup) {
             alert('Load a BMD model first.');
             return;
         }
-        
+
+        const bakeSkinning = options.bakeSkinning === true;
+
+        // Deduplicate animation tracks (safety net for ANIMATION_DUPLICATE_TARGETS)
+        const animations = bakeSkinning
+            ? []
+            : this.loadedGroup.animations.map(clip => {
+                const seen = new Set<string>();
+                const uniqueTracks = clip.tracks.filter(track => {
+                    if (seen.has(track.name)) return false;
+                    seen.add(track.name);
+                    return true;
+                });
+                const deduped = new THREE.AnimationClip(clip.name, clip.duration, uniqueTracks);
+                deduped.userData = clip.userData;
+                return deduped;
+            });
+
+        // Temporarily swap MeshPhongMaterial → MeshStandardMaterial for glTF compliance
+        // (glTF is a PBR format; the exporter only fully supports Standard/Basic materials)
+        const materialSwaps: { mesh: THREE.Mesh; original: THREE.Material }[] = [];
+        this.loadedGroup.traverse(obj => {
+            if ((obj as THREE.Mesh).isMesh) {
+                const mat = (obj as THREE.Mesh).material as THREE.MeshPhongMaterial;
+                if (mat.type === 'MeshPhongMaterial') {
+                    const std = new THREE.MeshStandardMaterial({
+                        color: mat.color,
+                        map: mat.map,
+                        side: mat.side,
+                        transparent: mat.transparent,
+                        opacity: mat.opacity,
+                        alphaTest: mat.alphaTest,
+                        alphaMap: mat.alphaMap,
+                        emissive: mat.emissive,
+                        emissiveMap: mat.emissiveMap,
+                        normalMap: mat.normalMap,
+                        roughness: 0.8,
+                        metalness: 0.0,
+                    });
+                    materialSwaps.push({ mesh: obj as THREE.Mesh, original: mat });
+                    (obj as THREE.Mesh).material = std;
+                }
+            }
+        });
+
+        const exportRoot = bakeSkinning
+            ? bakeSkinnedModelForExport(this.loadedGroup)
+            : this.loadedGroup;
+
         const exporter = new GLTFExporter();
-        
-        // Settings: binary .glb, embed images, include animations
-        const options = {
+        const exporterOptions = {
             binary: true,
-            animations: this.loadedGroup.animations,
+            animations,
             embedImages: true,
         };
-        
-        exporter.parse(
-            this.loadedGroup,
-            (result: ArrayBuffer | { [key: string]: any }) => {
+
+        try {
+            const result = await exporter.parseAsync(exportRoot, exporterOptions);
             const glbBuffer = result as ArrayBuffer;
             const blob = new Blob([glbBuffer], { type: 'model/gltf-binary' });
-        
+
             const nameBase =
                 (this.loadedGroup!.name || 'model').replace(/[^a-z0-9_-]/gi, '_');
             const stamp = new Date()
                 .toISOString()
                 .replace(/[:T]/g, '')
                 .split('.')[0];
-            const fileName = `${nameBase}_${stamp}.glb`;
-        
+            const fileName = `${nameBase}${bakeSkinning ? '_ai_baked' : ''}_${stamp}.glb`;
+
             const link = document.createElement('a');
             link.href = URL.createObjectURL(blob);
             link.download = fileName;
             link.click();
             URL.revokeObjectURL(link.href);
-        
+
             logger.debug(`✔️  Saved ${fileName} (${(blob.size / 1024).toFixed(1)} KB)`);
-            },
-            (error) => {
+        } catch (error) {
             logger.error('❌ GLTFExporter error:', error);
             alert('Error during export. Check the console.');
-            },
-            options
-        );
+        } finally {
+            // Restore original materials and dispose temporaries
+            for (const { mesh, original } of materialSwaps) {
+                const temp = mesh.material as THREE.MeshStandardMaterial;
+                mesh.material = original;
+                temp.dispose();
+            }
+        }
     }
 
     private exportGif() {
         if (this.isRecordingGif) return;
+        if (!this.rendererReady) {
+            this.setStatusMessage('Renderer is still initializing.');
+            return;
+        }
         if (!this.loadedGroup) {
             alert('Load a BMD model first.');
             return;
@@ -932,17 +1457,22 @@ class App {
     //----------------------------------------------------------
     // MODEL LOADING - Modified
     //----------------------------------------------------------
-    private async loadAndDisplayModel() {
+    private async loadAndDisplayModel(options?: { textureFiles?: File[]; suppressRecent?: boolean; skipClear?: boolean }) {
         if (!this.bmdFile) return;
+        const textureFiles = options?.textureFiles;
+        const suppressRecent = options?.suppressRecent ?? false;
+        const skipClear = options?.skipClear ?? false;
         const statusEl = document.getElementById('status')!;
         statusEl.textContent = 'Loading model…';
         logger.groupDebug('loadAndDisplayModel()');
         logger.time('loadAndDisplayModel');
 
         // Reset state
-        this.clearScene();
-        this.loadedGroup = null;
-        this.requiredTextures = [];
+        if (!skipClear) {
+            this.clearScene();
+            this.loadedGroup = null;
+            this.requiredTextures = [];
+        }
         document.getElementById('texture-controls')!.style.display = 'none';
 
         try {
@@ -964,6 +1494,37 @@ class App {
             this.updateTextureUI();
             this.updateDiagnosticInfo();
             if (this.exportBtn) this.exportBtn.disabled = false;
+            this.emitStateChanged();
+
+            if (!suppressRecent) {
+                const recentEntry: RecentModelEntry = {
+                    label: this.pendingRecentModelContext?.label || this.bmdFile?.name || 'Model',
+                    timestamp: Date.now(),
+                    modelFileKey: this.pendingRecentModelContext?.modelFileKey ?? null,
+                    sourceWorldNumber: this.pendingRecentModelContext?.sourceWorldNumber ?? null,
+                };
+                this.onModelLoaded?.(recentEntry);
+                this.pendingRecentModelContext = null;
+            }
+
+            if (textureFiles?.length) {
+                let autoAppliedCount = 0;
+                const matchingTextureFiles = selectPreferredTextureCandidates(
+                    textureFiles,
+                    requiredTextures,
+                    textureFile => textureFile.name,
+                );
+
+                for (const textureFile of matchingTextureFiles) {
+                    const applied = await this.loadAndApplyTexture(textureFile, { promptOnUnmatched: false });
+                    if (applied) {
+                        autoAppliedCount++;
+                    }
+                }
+                if (autoAppliedCount > 0) {
+                    statusEl.textContent = `Loaded: ${group.name} | Auto-loaded ${autoAppliedCount} matching world textures`;
+                }
+            }
 
             // Auto-search and load textures in Electron
             if (isElectron() && this.lastBmdFilePath && requiredTextures.length > 0) {
@@ -978,22 +1539,18 @@ class App {
                     logger.debug('[Electron] Search result:', foundTextures);
 
                     if (foundCount > 0) {
-                        // Count total files (each texture name may have multiple files)
-                        const totalFiles = Object.values(foundTextures).reduce((sum, paths) => sum + paths.length, 0);
-                        logger.debug(`%c[Electron] Found ${foundCount} texture names (${totalFiles} files), loading...`, 'color: #4CAF50');
+                        const texturePaths = selectPreferredTexturePaths(foundTextures, requiredTextures);
+                        logger.debug(`%c[Electron] Found ${foundCount} texture names, loading ${texturePaths.length} preferred files...`, 'color: #4CAF50');
 
-                        // Load each found texture file
-                        for (const [textureName, texturePaths] of Object.entries(foundTextures)) {
-                            for (const texturePath of texturePaths) {
-                                const fileData = await readFileFromPath(texturePath);
-                                if (fileData) {
-                                    const file = createFileFromElectronData(fileData.name, fileData.data);
-                                    await this.loadAndApplyTexture(file);
-                                }
+                        for (const texturePath of texturePaths) {
+                            const fileData = await readFileFromPath(texturePath);
+                            if (fileData) {
+                                const file = createFileFromElectronData(fileData.name, fileData.data);
+                                await this.loadAndApplyTexture(file, { promptOnUnmatched: false });
                             }
                         }
 
-                        statusEl.textContent = `Loaded: ${group.name} | Auto-loaded ${totalFiles} texture files for ${foundCount} base names`;
+                        statusEl.textContent = `Loaded: ${group.name} | Auto-loaded ${texturePaths.length} texture files for ${foundCount} base names`;
                     } else {
                         statusEl.textContent = `Loaded: ${group.name} | No textures found automatically`;
                     }
@@ -1023,7 +1580,6 @@ class App {
                     }
                 }
             });
-
             // --- meshRefs & blending UI ---
             this.meshRefs = [];
             group.traverse(obj => {
@@ -1039,6 +1595,7 @@ class App {
         } catch (err) {
             logger.error('loader.load() ERROR', err);
             statusEl.textContent = `Error: ${(err as Error).message}`;
+            this.pendingRecentModelContext = null;
         } finally {
             logger.timeEnd('loadAndDisplayModel');
             logger.groupEnd();
@@ -1071,7 +1628,8 @@ class App {
             }
 
             logger.debug('[loadExternalAnimations] Using skeleton with', skeleton.bones.length, 'bones');
-            const clips = this.bmdLoader.loadAnimationsFrom(buffer, skeleton);
+            const bmdBones = this.loadedGroup?.userData.bmdBones as THREE.Bone[] | undefined;
+            const clips = this.bmdLoader.loadAnimationsFrom(buffer, skeleton, bmdBones);
             if (clips.length) {
                 this.loadedGroup.animations = clips;
                 this.setupAnimations(this.loadedGroup);
@@ -1121,10 +1679,38 @@ class App {
                 mat.blending    = modes[select.value] as THREE.Blending;
                 mat.transparent = mat.blending !== THREE.NoBlending;
                 mat.depthWrite  = mat.blending === THREE.NoBlending;
+                this.rememberMaterialAlphaDefaults(mat);
+                this.applyBlackKeyThresholdToMaterial(mat);
                 mat.needsUpdate = true;
             });
 
-            row.append(label, select);
+            const thresholdWrap = document.createElement('div');
+            thresholdWrap.className = 'blend-threshold';
+
+            const thresholdLabel = document.createElement('span');
+            thresholdLabel.className = 'blend-threshold-label';
+            thresholdLabel.textContent = 'Black Key';
+
+            const thresholdSlider = document.createElement('input');
+            thresholdSlider.type = 'range';
+            thresholdSlider.min = '0';
+            thresholdSlider.max = '0.5';
+            thresholdSlider.step = '0.01';
+            thresholdSlider.className = 'modern-slider';
+            thresholdSlider.value = this.getMeshBlackKeyThreshold(mesh).toFixed(2);
+
+            const thresholdValue = document.createElement('span');
+            thresholdValue.className = 'blend-threshold-value';
+            thresholdValue.textContent = thresholdSlider.value;
+
+            thresholdSlider.addEventListener('input', () => {
+                const value = Math.max(0, Math.min(0.5, parseFloat(thresholdSlider.value) || 0));
+                thresholdValue.textContent = value.toFixed(2);
+                this.setMeshBlackKeyThreshold(mesh, value);
+            });
+
+            thresholdWrap.append(thresholdLabel, thresholdSlider, thresholdValue);
+            row.append(label, select, thresholdWrap);
             list.appendChild(row);
         });
 
@@ -1144,7 +1730,16 @@ class App {
                     if (Array.isArray(mat)) {
                         mat.forEach(m => m.dispose());
                     } else if (mat) {
-                        if ('map' in mat && mat.map && mat.map instanceof THREE.Texture) mat.map.dispose();
+                        if ('map' in mat && mat.map && mat.map instanceof THREE.Texture) {
+                            this.disposeDerivedAlphaTexture(mat.map);
+                            if ('alphaMap' in mat) {
+                                (mat as THREE.MeshPhongMaterial).alphaMap = null;
+                            }
+                            mat.map.dispose();
+                        }
+                        if ('alphaMap' in mat && mat.alphaMap && mat.alphaMap instanceof THREE.Texture && mat.alphaMap !== (mat as THREE.MeshPhongMaterial).map) {
+                            mat.alphaMap.dispose();
+                        }
                         mat.dispose();
                     }
                 }
@@ -1212,119 +1807,28 @@ class App {
         }
     }
 
-  // Corrected loadAndApplyTexture function in main.ts
-
-    private async loadAndApplyTexture(file: File) {
+    private async loadAndApplyTexture(file: File, options?: { promptOnUnmatched?: boolean }): Promise<boolean> {
         if (!this.loadedGroup) {
-        logger.warn('Model not loaded - no textures.');
-        return;
+            logger.warn('Model not loaded - no textures.');
+            return false;
         }
-    
+
         const status = document.getElementById('status')!;
-        status.textContent = `Loading: ${file.name}…`;
-
-        try {
-        const ext = file.name.split('.').pop()!.toLowerCase();
-        let tex: THREE.Texture;
-    
-        if (ext === 'tga') {
-            tex = await this.textureLoader.loadAsync(
-                    await convertTgaToDataUrl(await file.arrayBuffer()));
-        } else if (ext === 'ozj' || ext === 'ozt') {
-            tex = await this.textureLoader.loadAsync(
-                    await convertOzjToDataUrl(await file.arrayBuffer()));
-        } else {                              // jpg / png
-            const url = URL.createObjectURL(file);
-            tex = await this.textureLoader.loadAsync(url);
-            URL.revokeObjectURL(url);
-        }
-    
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-        tex.flipY = false;
-        tex.name  = file.name;
-        const blendResult = detectBlendModeFromTexture(tex, file.name);
-        tex.userData.blendHeuristic = blendResult;
-        const blendLabel = describeBlendMode(blendResult.mode);
-        const confidenceLabel = Math.round(blendResult.confidence * 100);
-        const blendByHint = new Map<string, BlendHeuristicResult>([
-            [file.name.toLowerCase(), blendResult],
-        ]);
-        const getBlendForHint = (hint: string): BlendHeuristicResult => {
-            const key = hint.toLowerCase();
-            const cached = blendByHint.get(key);
-            if (cached) return cached;
-            const detected = detectBlendModeFromTexture(tex, hint);
-            blendByHint.set(key, detected);
-            return detected;
-        };
-        logger.debug(
-            `[Texture blend] "${file.name}" -> ${blendLabel} (${confidenceLabel}%) ${blendResult.reason}`,
-            { metrics: blendResult.metrics, scores: blendResult.scores },
-        );
-    
-        // allow loading PNG/JPG in place of OZT/OZJ and vice versa
-        const equivExt: Record<string,string[]> = {
-            jpg:  ['ozj', 'jpeg'],
-            jpeg: ['ozj', 'jpg'],
-            ozj:  ['jpg', 'jpeg', 'png'],
-            png:  ['ozj', 'ozt'],
-            tga:  ['ozt', 'png'],
-            ozt:  ['tga', 'png'],
-        };
-
-        const fileName  = file.name.toLowerCase();
-        const fileBase  = fileName.replace(/\.[^.]+$/, '');
-        const fileExt   = fileName.split('.').pop()!;
-
-        function normalizeWanted(path: string): { base:string; ext:string } {
-            const name = path.split(/[\\/]/).pop()!.toLowerCase();
-            const ext  = name.split('.').pop()!;
-            const base = name.replace(/\.[^.]+$/, '');
-            return { base, ext };
-        }
+        const promptOnUnmatched = options?.promptOnUnmatched ?? true;
+        const { base: fileBase, ext: fileExt } = normalizeTextureName(file.name);
 
         const meshList: { mesh: THREE.Mesh; path: string; isMatch: boolean }[] = [];
         this.loadedGroup.traverse(obj => {
             if ((obj as THREE.Mesh).isMesh && obj.userData.texturePath) {
                 const wantedPath = obj.userData.texturePath as string;
-                const { base:wantedBase, ext:wantedExt } = normalizeWanted(wantedPath);
-                const extMatch =
-                    wantedExt === fileExt ||
-                    (equivExt[wantedExt]?.includes(fileExt)) ||
-                    (equivExt[fileExt]?.includes(wantedExt));
-                const isMatch = extMatch && wantedBase === fileBase;
+                const { base: wantedBase, ext: wantedExt } = normalizeTextureName(wantedPath);
+                const isMatch = wantedBase === fileBase && areTextureExtensionsCompatible(wantedExt, fileExt);
                 meshList.push({ mesh: obj as THREE.Mesh, path: wantedPath, isMatch });
             }
         });
 
-        if (fileExt === 'ozj' || fileExt === 'ozt') {
-            let applied = false;
-            let firstAppliedResult: BlendHeuristicResult | null = null;
-            meshList.forEach(m => {
-                if (m.isMatch) {
-                    const blendForMesh = getBlendForHint(m.path);
-                    const mat = m.mesh.material as THREE.MeshPhongMaterial;
-                    if (mat.map) mat.map.dispose();
-                    mat.map = tex;
-                    mat.color.set(0xffffff);
-                    applyBlendModeToMaterial(mat, blendForMesh);
-                    applied = true;
-                    if (!firstAppliedResult) {
-                        firstAppliedResult = blendForMesh;
-                    }
-                    if (this.exportBtn) this.exportBtn.disabled = false;
-                }
-            });
-
-            if (!applied) {
-                logger.warn(`No matching mesh found for "${file.name}"`);
-            }
-
-            status.textContent = applied
-                ? `Texture "${file.name}" loaded (blend: ${describeBlendMode((firstAppliedResult || blendResult).mode)}, ${Math.round((firstAppliedResult || blendResult).confidence * 100)}%).`
-                : `No matching mesh found for "${file.name}". Check the console.`;
-        } else {
+        let targets = meshList.filter(m => m.isMatch);
+        if (targets.length === 0 && promptOnUnmatched && fileExt !== 'ozj' && fileExt !== 'ozt') {
             let promptMsg = `Apply texture "${file.name}" to which mesh?\n`;
             meshList.forEach((m, i) => {
                 promptMsg += `${i}: ${m.mesh.name} (needs ${m.path})\n`;
@@ -1332,27 +1836,639 @@ class App {
 
             const choiceStr = window.prompt(promptMsg, '');
             const idx = choiceStr !== null ? parseInt(choiceStr, 10) : NaN;
+            targets = !isNaN(idx) && meshList[idx] ? [meshList[idx]] : [];
+        }
 
-            if (!isNaN(idx) && meshList[idx]) {
-                const target = meshList[idx].mesh;
-                const targetPath = meshList[idx].path;
-                const targetBlend = getBlendForHint(targetPath);
-                const mat = target.material as THREE.MeshPhongMaterial;
-                if (mat.map) mat.map.dispose();
-                mat.map = tex;
-                mat.color.set(0xffffff);
-                applyBlendModeToMaterial(mat, targetBlend);
-                if (this.exportBtn) this.exportBtn.disabled = false;
-                status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(targetBlend.mode)}, ${Math.round(targetBlend.confidence * 100)}%).`;
-            } else {
-                status.textContent = `Texture "${file.name}" was not applied.`;
+        if (targets.length === 0) {
+            logger.warn(`No matching mesh found for "${file.name}"`);
+            status.textContent = promptOnUnmatched
+                ? `Texture "${file.name}" was not applied.`
+                : `No matching mesh found for "${file.name}".`;
+            return false;
+        }
+
+        status.textContent = `Loading: ${file.name}...`;
+
+        try {
+            const tex = await this.loadTextureForViewer(file, fileExt);
+            const blendResult = detectBlendModeFromTexture(tex, file.name);
+            tex.userData.blendHeuristic = blendResult;
+            const blendLabel = describeBlendMode(blendResult.mode);
+            const confidenceLabel = Math.round(blendResult.confidence * 100);
+            const blendByHint = new Map<string, BlendHeuristicResult>([
+                [file.name.toLowerCase(), blendResult],
+            ]);
+            const getBlendForHint = (hint: string): BlendHeuristicResult => {
+                const key = hint.toLowerCase();
+                const cached = blendByHint.get(key);
+                if (cached) return cached;
+                const detected = detectBlendModeFromTexture(tex, hint);
+                blendByHint.set(key, detected);
+                return detected;
+            };
+            logger.debug(
+                `[Texture blend] "${file.name}" -> ${blendLabel} (${confidenceLabel}%) ${blendResult.reason}`,
+                { metrics: blendResult.metrics, scores: blendResult.scores },
+            );
+
+            for (const target of targets) {
+                this.applyLoadedTextureToMesh(target.mesh, tex, getBlendForHint(target.path));
+            }
+
+            if (this.exportBtn) this.exportBtn.disabled = false;
+            const firstBlend = getBlendForHint(targets[0].path);
+            status.textContent = `Texture "${file.name}" loaded (blend: ${describeBlendMode(firstBlend.mode)}, ${Math.round(firstBlend.confidence * 100)}%).`;
+            this.rememberAppliedTextureFile(file);
+            return true;
+        } catch (e) {
+            logger.error('Texture load error:', e);
+            status.textContent = `Error: ${(e as Error).message}`;
+            return false;
+        }
+    }
+
+    private async loadTextureForViewer(file: File, ext: string): Promise<THREE.Texture> {
+        let tex: THREE.Texture;
+
+        if (ext === 'tga') {
+            tex = await this.textureLoader.loadAsync(await convertTgaToDataUrl(await file.arrayBuffer()));
+        } else if (ext === 'ozj' || ext === 'ozt') {
+            tex = await this.textureLoader.loadAsync(await convertOzjToDataUrl(await file.arrayBuffer()));
+        } else {
+            const url = URL.createObjectURL(file);
+            try {
+                tex = await this.textureLoader.loadAsync(url);
+            } finally {
+                URL.revokeObjectURL(url);
             }
         }
-    
-        } catch (e) {
-        logger.error('Texture load error:', e);
-        status.textContent = `Error: ${(e as Error).message}`;
+
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        tex.flipY = false;
+        tex.name = file.name;
+        return tex;
+    }
+
+    private applyLoadedTextureToMesh(
+        mesh: THREE.Mesh,
+        texture: THREE.Texture,
+        blendResult: BlendHeuristicResult,
+    ): void {
+        const mat = mesh.material as THREE.MeshPhongMaterial;
+        if (mat.map) {
+            this.disposeDerivedAlphaTexture(mat.map);
+            mat.alphaMap = null;
+            mat.map.dispose();
         }
+
+        mat.map = texture;
+        mat.color.set(0xffffff);
+        applyBlendModeToMaterial(mat, blendResult);
+        this.rememberMaterialAlphaDefaults(mat);
+        this.applyBlackKeyThresholdToMaterial(mat);
+    }
+
+    //----------------------------------------------------------
+    // Folder browser  (lazy-loaded thumbnails via IntersectionObserver)
+    //----------------------------------------------------------
+    private initFolderBrowser() {
+        this.folderPanelEl = document.getElementById('folder-browser-panel');
+
+        const zone = document.getElementById('folder-bmd-drop-zone')!;
+        const input = document.getElementById('folder-bmd-input') as HTMLInputElement;
+        const closeBtn = document.getElementById('folder-browser-close')!;
+
+        zone.addEventListener('click', () => input.click());
+        zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over'); });
+        zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            zone.classList.remove('drag-over');
+            if (e.dataTransfer?.files.length) this.loadFolderFiles(e.dataTransfer.files);
+        });
+        input.addEventListener('change', (e) => {
+            const files = (e.target as HTMLInputElement).files;
+            if (files?.length) this.loadFolderFiles(files);
+            input.value = '';
+        });
+        closeBtn.addEventListener('click', () => this.closeFolderPanel());
+    }
+
+    // -- folder loading --------------------------------------------------
+
+    private loadFolderFiles(files: FileList) {
+        const TEXTURE_EXTS = new Set(['ozj', 'ozt', 'tga', 'png', 'jpg', 'jpeg', 'bmp']);
+        const allFiles = Array.from(files);
+
+        this.folderFiles = allFiles
+            .filter(f => f.name.toLowerCase().endsWith('.bmd'))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        this.folderTextureFiles = allFiles.filter(f => {
+            const ext = f.name.toLowerCase().split('.').pop();
+            return ext && TEXTURE_EXTS.has(ext);
+        });
+
+        if (this.folderFiles.length === 0) return;
+
+        // Invalidate any in-flight thumbnail work from a previous folder
+        ++this.thumbnailGenId;
+        this.thumbnailPending.clear();
+        this.thumbnailVisible.clear();
+        this.thumbnailProcessing = false;
+        this.folderObserver?.disconnect();
+
+        this.folderActiveIndex = null;
+        this.renderFolderPanel();
+        this.openFolderPanel();
+        this.setupFolderObserver();
+    }
+
+    // -- IntersectionObserver for lazy thumbnails -------------------------
+
+    private setupFolderObserver() {
+        const listEl = document.getElementById('folder-browser-list');
+        if (!listEl) return;
+
+        this.folderObserver = new IntersectionObserver((entries) => {
+            const visibilityEntries = entries.map(entry => {
+                const index = parseInt((entry.target as HTMLElement).dataset.index!, 10);
+
+                return {
+                    index,
+                    isVisible: !isNaN(index) && entry.isIntersecting && entry.intersectionRatio > 0,
+                    hasCachedThumbnail: !isNaN(index) && this.hasCachedThumbnail(index),
+                };
+            }).filter(entry => !isNaN(entry.index));
+
+            const update = applyThumbnailVisibilityEntries({
+                visibleIndexes: this.thumbnailVisible,
+                pendingIndexes: this.thumbnailPending,
+            }, visibilityEntries);
+
+            this.thumbnailVisible = update.state.visibleIndexes;
+            this.thumbnailPending = update.state.pendingIndexes;
+
+            for (const entry of visibilityEntries) {
+                if (entry.hasCachedThumbnail) continue;
+                if (entry.isVisible) {
+                    this.applyCardThumbnailLoading(entry.index);
+                } else {
+                    this.applyCardThumbnailPending(entry.index);
+                }
+            }
+
+            for (const idx of update.cachedIndexesToApply) {
+                const key = this.thumbCacheKey(idx);
+                const cached = key ? this.thumbnailCache.get(key) : undefined;
+                if (cached !== undefined) {
+                    this.applyCardThumbnail(idx, cached);
+                }
+            }
+
+            this.kickThumbnailQueue();
+        }, {
+            root: listEl,
+            rootMargin: '0px',
+            threshold: 0,
+        });
+
+        listEl.querySelectorAll('.model-card').forEach(card => {
+            this.folderObserver!.observe(card);
+        });
+    }
+
+    // -- thumbnail render queue -------------------------------------------
+
+    private kickThumbnailQueue() {
+        if (this.thumbnailProcessing || this.thumbnailPending.size === 0) return;
+        this.thumbnailProcessing = true;
+        this.processThumbnailQueue();
+    }
+
+    private async processThumbnailQueue() {
+        const genId = this.thumbnailGenId;
+
+        while (genId === this.thumbnailGenId) {
+            const idx = getNextVisibleThumbnailIndex({
+                visibleIndexes: this.thumbnailVisible,
+                pendingIndexes: this.thumbnailPending,
+            });
+            if (idx === null) break;
+
+            const nextQueue = removeThumbnailIndexFromQueue({
+                visibleIndexes: this.thumbnailVisible,
+                pendingIndexes: this.thumbnailPending,
+            }, idx);
+            this.thumbnailVisible = nextQueue.visibleIndexes;
+            this.thumbnailPending = nextQueue.pendingIndexes;
+
+            const file = this.folderFiles[idx];
+            if (!file) continue;
+
+            const cacheKey = this.thumbCacheKey(idx);
+            if (!cacheKey) continue;
+
+            let thumb: string;
+
+            if (this.thumbnailCache.has(cacheKey)) {
+                thumb = this.thumbnailCache.get(cacheKey)!;
+            } else {
+                if (!this.thumbnailVisible.has(idx)) continue;
+                thumb = await this.generateThumbnail(file);
+                if (genId !== this.thumbnailGenId) break;
+                this.thumbnailCache.set(cacheKey, thumb);
+            }
+
+            if (this.thumbnailVisible.has(idx)) {
+                this.applyCardThumbnail(idx, thumb);
+            } else {
+                this.applyCardThumbnailPending(idx);
+            }
+
+            // Yield to main thread so the UI stays responsive
+            await new Promise<void>(r => setTimeout(r, 0));
+        }
+
+        this.thumbnailProcessing = false;
+        if (genId === this.thumbnailGenId && getNextVisibleThumbnailIndex({
+            visibleIndexes: this.thumbnailVisible,
+            pendingIndexes: this.thumbnailPending,
+        }) !== null) {
+            this.kickThumbnailQueue();
+        }
+    }
+
+    private hasCachedThumbnail(index: number): boolean {
+        const key = this.thumbCacheKey(index);
+        return key !== null && this.thumbnailCache.has(key);
+    }
+
+    private thumbCacheKey(index: number): string | null {
+        const f = this.folderFiles[index];
+        return f ? `${f.name}|${f.size}|${f.lastModified}` : null;
+    }
+
+    // -- lightweight thumbnail renderer -----------------------------------
+
+    private getThumbnailRenderer(): THREE.WebGLRenderer {
+        if (!this.thumbnailRenderer) {
+            this.thumbnailRenderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+            this.thumbnailRenderer.setSize(180, 136);
+            this.thumbnailRenderer.setPixelRatio(1);
+        }
+        return this.thumbnailRenderer;
+    }
+
+    /**
+     * Build a minimal THREE.Group for thumbnail rendering.
+     * Uses bind-pose bone matrices (frame 0, action 0) to bake vertex positions
+     * into world space so the model renders in the correct pose.
+     */
+    private async buildThumbnailGroup(bmd: BMD, textureFiles: File[]): Promise<THREE.Group> {
+        if (!this.thumbnailMaterial) {
+            this.thumbnailMaterial = new THREE.MeshPhongMaterial({ color: 0xcccccc, side: THREE.DoubleSide });
+        }
+
+        // --- Compute world-space bone matrices from bind-pose (action 0, key 0) ---
+        const boneWorldMats: THREE.Matrix4[] = [];
+        for (let i = 0; i < bmd.bones.length; i++) {
+            const bone = bmd.bones[i];
+            const local = new THREE.Matrix4();
+            if (!bone.isDummy && bone.matrixes.length > 0) {
+                const m = bone.matrixes[0];
+                const p = m.position[0];
+                const q = m.quaternion[0];
+                local.compose(
+                    new THREE.Vector3(p.x, p.y, p.z),
+                    new THREE.Quaternion(q.x, q.y, q.z, q.w),
+                    new THREE.Vector3(1, 1, 1),
+                );
+            }
+            const parentIdx = bone.parent;
+            if (parentIdx >= 0 && parentIdx < boneWorldMats.length) {
+                local.premultiply(boneWorldMats[parentIdx]);
+            }
+            boneWorldMats.push(local);
+        }
+
+        // --- Texture lookup: base-name (no ext) → File ---
+        const texByBase = new Map<string, File>();
+        for (const f of textureFiles) {
+            const base = f.name.toLowerCase().replace(/\.[^.]+$/, '');
+            if (!texByBase.has(base)) texByBase.set(base, f);
+        }
+
+        const loader = new THREE.TextureLoader();
+        const group = new THREE.Group();
+        const tmpVec = new THREE.Vector3();
+
+        for (const bmdMesh of bmd.meshes) {
+            const positions: number[] = [];
+            const normals: number[] = [];
+            const uvs: number[] = [];
+
+            for (const tri of bmdMesh.triangles) {
+                const vi = tri.vertexIndex;
+                const ni = tri.normalIndex;
+                const ti = tri.texCoordIndex;
+
+                const push = (v: number, n: number, t: number) => {
+                    if (v < 0 || v >= bmdMesh.vertices.length ||
+                        n < 0 || n >= bmdMesh.normals.length) return;
+                    const vert = bmdMesh.vertices[v];
+                    const norm = bmdMesh.normals[n];
+
+                    // Apply bind-pose bone transform to bake world-space position
+                    const boneMat = boneWorldMats[vert.node];
+                    if (boneMat) {
+                        tmpVec.set(vert.position.x, vert.position.y, vert.position.z)
+                               .applyMatrix4(boneMat);
+                        positions.push(tmpVec.x, tmpVec.y, tmpVec.z);
+                    } else {
+                        positions.push(vert.position.x, vert.position.y, vert.position.z);
+                    }
+
+                    normals.push(norm.normal.x, norm.normal.y, norm.normal.z);
+                    if (t >= 0 && t < bmdMesh.texCoords.length) {
+                        uvs.push(bmdMesh.texCoords[t].u, bmdMesh.texCoords[t].v);
+                    } else {
+                        uvs.push(0, 0);
+                    }
+                };
+
+                push(vi[0], ni[0], ti[0]);
+                push(vi[2], ni[2], ti[2]);
+                push(vi[1], ni[1], ti[1]);
+
+                if (tri.polygon === 4) {
+                    push(vi[0], ni[0], ti[0]);
+                    push(vi[2], ni[2], ti[2]);
+                    push(vi[3], ni[3], ti[3]);
+                }
+            }
+
+            if (positions.length === 0) continue;
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+
+            // Try to find and load a matching texture
+            let material: THREE.MeshPhongMaterial = this.thumbnailMaterial;
+            if (texByBase.size > 0 && bmdMesh.texturePath) {
+                const wantedName = bmdMesh.texturePath.split(/[\\/]/).pop()!.toLowerCase();
+                const wantedBase = wantedName.replace(/\.[^.]+$/, '');
+                const texFile = texByBase.get(wantedBase);
+                if (texFile) {
+                    try {
+                        const cacheKey = texFile.name.toLowerCase();
+                        let dataUrl = this.thumbnailTexDataUrlCache.get(cacheKey);
+                        if (!dataUrl) {
+                            const ext = texFile.name.toLowerCase().split('.').pop()!;
+                            if (ext === 'ozj' || ext === 'ozt') {
+                                dataUrl = await convertOzjToDataUrl(await texFile.arrayBuffer());
+                            } else if (ext === 'tga') {
+                                dataUrl = await convertTgaToDataUrl(await texFile.arrayBuffer());
+                            } else {
+                                dataUrl = URL.createObjectURL(texFile);
+                            }
+                            this.thumbnailTexDataUrlCache.set(cacheKey, dataUrl);
+                        }
+                        const tex = await loader.loadAsync(dataUrl);
+                        tex.colorSpace = THREE.SRGBColorSpace;
+                        tex.flipY = false;
+                        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+                        material = new THREE.MeshPhongMaterial({ map: tex, side: THREE.DoubleSide, transparent: true, alphaTest: 0.05 });
+                    } catch {
+                        // fallback to shared gray material
+                    }
+                }
+            }
+
+            group.add(new THREE.Mesh(geo, material));
+        }
+
+        group.rotation.x = -Math.PI / 2;
+        return group;
+    }
+
+    private async generateThumbnail(file: File): Promise<string> {
+        const renderer = this.getThumbnailRenderer();
+
+        // Reuse a persistent mini-scene (lights survive across calls)
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0c1520);
+        scene.add(new THREE.AmbientLight(0x8899cc, 1.5));
+        const dir = new THREE.DirectionalLight(0xffffff, 3.8);
+        dir.position.set(1.2, 2.2, 1.8);
+        scene.add(dir);
+        const rim = new THREE.DirectionalLight(0x3377bb, 1.1);
+        rim.position.set(-1.2, 0.5, -1);
+        scene.add(rim);
+
+        try {
+            const buffer = await file.arrayBuffer();
+
+            // Suppress console spam from the parser during batch operations
+            const saved = {
+                groupCollapsed: console.groupCollapsed,
+                groupEnd: console.groupEnd,
+                log: console.log,
+                time: console.time,
+                timeEnd: console.timeEnd,
+            };
+            const noop = (() => {}) as (..._args: unknown[]) => void;
+            console.groupCollapsed = noop;
+            console.groupEnd = noop;
+            console.log = noop;
+            console.time = noop;
+            console.timeEnd = noop;
+
+            let bmd: BMD;
+            try {
+                bmd = this.bmdLoader.parse(buffer, { bindPoseOnly: true });
+            } finally {
+                console.groupCollapsed = saved.groupCollapsed;
+                console.groupEnd = saved.groupEnd;
+                console.log = saved.log;
+                console.time = saved.time;
+                console.timeEnd = saved.timeEnd;
+            }
+
+            const group = await this.buildThumbnailGroup(bmd, this.folderTextureFiles);
+            scene.add(group);
+            group.updateWorldMatrix(true, true);
+
+            const box = new THREE.Box3().setFromObject(group);
+            if (box.isEmpty()) throw new Error('empty');
+
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = 44;
+            const dist = (maxDim / 2) / Math.tan((fov / 2) * (Math.PI / 180)) * 1.15;
+
+            const camera = new THREE.PerspectiveCamera(fov, 180 / 136, 0.01, dist * 20);
+            camera.position.set(
+                center.x + dist * 0.38,
+                center.y + dist * 0.32,
+                center.z + dist,
+            );
+            camera.lookAt(center);
+
+            renderer.render(scene, camera);
+            const dataUrl = renderer.domElement.toDataURL('image/jpeg', 0.78);
+
+            // Dispose geometry and per-mesh materials/textures; shared material stays alive
+            group.traverse(obj => {
+                const mesh = obj as THREE.Mesh;
+                if (!mesh.isMesh) return;
+                mesh.geometry.dispose();
+                const mat = mesh.material as THREE.MeshPhongMaterial;
+                if (mat !== this.thumbnailMaterial) {
+                    mat.map?.dispose();
+                    mat.dispose();
+                }
+            });
+
+            return dataUrl;
+        } catch {
+            return '';
+        }
+    }
+
+    // -- panel DOM --------------------------------------------------------
+
+    private renderFolderPanel() {
+        const listEl = document.getElementById('folder-browser-list');
+        const countEl = document.getElementById('folder-browser-count');
+        if (!listEl || !countEl) return;
+
+        countEl.textContent = `${this.folderFiles.length} model${this.folderFiles.length !== 1 ? 's' : ''}`;
+        listEl.innerHTML = '';
+
+        this.folderFiles.forEach((file, i) => {
+            const card = document.createElement('div');
+            card.className = 'model-card' + (i === this.folderActiveIndex ? ' active' : '');
+            card.dataset.index = String(i);
+            const displayName = file.name.replace(/\.bmd$/i, '');
+
+            // Check cache — render thumbnail instantly if available
+            const cacheKey = this.thumbCacheKey(i);
+            const cached = cacheKey ? this.thumbnailCache.get(cacheKey) : undefined;
+
+            if (cached !== undefined) {
+                const thumbContent = cached
+                    ? `<img src="${cached}" alt="${file.name}">`
+                    : '<span class="thumb-placeholder">No preview</span>';
+                card.innerHTML = `
+                    <div class="model-card-thumb">${thumbContent}</div>
+                    <div class="model-card-info">
+                      <div class="model-card-name" title="${file.name}">${displayName}</div>
+                    </div>`;
+            } else {
+                card.innerHTML = `
+                    <div class="model-card-thumb"><span class="thumb-placeholder">Preview on scroll</span></div>
+                    <div class="model-card-info">
+                      <div class="model-card-name" title="${file.name}">${displayName}</div>
+                    </div>`;
+            }
+
+            card.addEventListener('click', () => this.loadFolderItem(i));
+            listEl.appendChild(card);
+        });
+    }
+
+    private applyCardThumbnail(index: number, dataUrl: string) {
+        const listEl = document.getElementById('folder-browser-list');
+        if (!listEl) return;
+        const card = listEl.querySelector<HTMLElement>(`[data-index="${index}"]`);
+        if (!card) return;
+        const thumbEl = card.querySelector<HTMLElement>('.model-card-thumb')!;
+        if (dataUrl) {
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            img.alt = this.folderFiles[index]?.name ?? '';
+            thumbEl.innerHTML = '';
+            thumbEl.appendChild(img);
+        } else {
+            thumbEl.innerHTML = '<span class="thumb-placeholder">No preview</span>';
+        }
+    }
+
+    private applyCardThumbnailLoading(index: number) {
+        const thumbEl = this.getCardThumbnailElement(index);
+        if (!thumbEl || this.hasCachedThumbnail(index)) return;
+        thumbEl.innerHTML = '<div class="thumb-spinner"></div>';
+    }
+
+    private applyCardThumbnailPending(index: number) {
+        const thumbEl = this.getCardThumbnailElement(index);
+        if (!thumbEl || this.hasCachedThumbnail(index)) return;
+        thumbEl.innerHTML = '<span class="thumb-placeholder">Preview on scroll</span>';
+    }
+
+    private getCardThumbnailElement(index: number): HTMLElement | null {
+        const listEl = document.getElementById('folder-browser-list');
+        if (!listEl) return null;
+        const card = listEl.querySelector<HTMLElement>(`[data-index="${index}"]`);
+        return card?.querySelector<HTMLElement>('.model-card-thumb') ?? null;
+    }
+
+    private async loadFolderItem(index: number) {
+        this.folderActiveIndex = index;
+        const listEl = document.getElementById('folder-browser-list');
+        if (listEl) {
+            listEl.querySelectorAll('.model-card').forEach((card, i) => {
+                card.classList.toggle('active', i === index);
+            });
+        }
+        await this.handleBmdFile(this.folderFiles[index], undefined, this.folderTextureFiles);
+    }
+
+    private openFolderPanel() {
+        this.folderPanelEl?.classList.add('open');
+    }
+
+    private closeFolderPanel() {
+        this.folderPanelEl?.classList.remove('open');
+        // Stop any in-flight thumbnail work when panel is closed
+        ++this.thumbnailGenId;
+        this.thumbnailPending.clear();
+        this.thumbnailVisible.clear();
+        this.thumbnailProcessing = false;
+        this.folderObserver?.disconnect();
+        this.thumbnailTexDataUrlCache.clear();
+    }
+
+    private removeTextures() {
+        if (!this.loadedGroup) return;
+        this.loadedGroup.traverse(obj => {
+            const mesh = obj as THREE.Mesh;
+            if (!mesh.isMesh) return;
+            const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            materials.forEach(mat => {
+                const phong = mat as THREE.MeshPhongMaterial;
+                if (phong.map) {
+                    this.disposeDerivedAlphaTexture(phong.map);
+                    phong.map.dispose();
+                    phong.map = null;
+                    phong.alphaMap = null;
+                }
+                phong.color.set(0xcccccc);
+                phong.transparent = false;
+                phong.depthWrite = true;
+                phong.blending = THREE.NormalBlending;
+                phong.alphaTest = 0;
+                phong.needsUpdate = true;
+            });
+        });
+        this.appliedTextureFiles.clear();
+        const status = document.getElementById('status');
+        if (status) status.textContent = 'Textures removed.';
     }
 
     private isDrawableTextureImage(
@@ -1363,6 +2479,148 @@ class App {
 
         const candidate = source as { width?: unknown; height?: unknown };
         return typeof candidate.width === 'number' && typeof candidate.height === 'number';
+    }
+
+    private rememberMaterialAlphaDefaults(material: THREE.Material) {
+        const userData = material.userData as {
+            alphaThresholdBaseAlphaTest?: number;
+            alphaThresholdBaseTransparent?: boolean;
+            alphaThresholdBaseDepthWrite?: boolean;
+            alphaThresholdBaseBlending?: THREE.Blending;
+        };
+
+        userData.alphaThresholdBaseAlphaTest = 'alphaTest' in material
+            ? (material as THREE.MeshPhongMaterial).alphaTest
+            : 0;
+        userData.alphaThresholdBaseTransparent = material.transparent;
+        userData.alphaThresholdBaseDepthWrite = material.depthWrite;
+        userData.alphaThresholdBaseBlending = material.blending;
+    }
+
+    private disposeDerivedAlphaTexture(texture: THREE.Texture) {
+        const derived = texture.userData?.blackKeyAlphaMap as THREE.Texture | undefined;
+        if (derived) {
+            derived.dispose();
+            delete texture.userData.blackKeyAlphaMap;
+        }
+    }
+
+    private ensureBlackKeyAlphaMap(texture: THREE.Texture): THREE.Texture | null {
+        const cached = texture.userData?.blackKeyAlphaMap as THREE.Texture | undefined;
+        if (cached) {
+            return cached;
+        }
+
+        const sourceImage = texture.image;
+        if (!this.isDrawableTextureImage(sourceImage)) {
+            return null;
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = sourceImage.width;
+        canvas.height = sourceImage.height;
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) {
+            return null;
+        }
+
+        context.drawImage(sourceImage, 0, 0);
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        const pixels = imageData.data;
+        for (let index = 0; index < pixels.length; index += 4) {
+            const mask = Math.max(pixels[index], pixels[index + 1], pixels[index + 2]);
+            const originalAlpha = pixels[index + 3] / 255;
+            const value = Math.round(mask * originalAlpha);
+            pixels[index] = value;
+            pixels[index + 1] = value;
+            pixels[index + 2] = value;
+            pixels[index + 3] = 255;
+        }
+        context.putImageData(imageData, 0, 0);
+
+        const alphaMap = new THREE.CanvasTexture(canvas);
+        alphaMap.colorSpace = THREE.NoColorSpace;
+        alphaMap.wrapS = texture.wrapS;
+        alphaMap.wrapT = texture.wrapT;
+        alphaMap.flipY = texture.flipY;
+        alphaMap.name = `${texture.name || 'texture'}__black_key_alpha`;
+        alphaMap.needsUpdate = true;
+        texture.userData.blackKeyAlphaMap = alphaMap;
+        return alphaMap;
+    }
+
+    private getMeshBlackKeyThreshold(mesh: THREE.Mesh): number {
+        const stored = mesh.userData.blackKeyThreshold;
+        if (typeof stored === 'number') {
+            return stored;
+        }
+
+        const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+        const materialStored = material?.userData?.blackKeyThreshold;
+        return typeof materialStored === 'number' ? materialStored : 0;
+    }
+
+    private setMeshBlackKeyThreshold(mesh: THREE.Mesh, value: number) {
+        mesh.userData.blackKeyThreshold = value;
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        materials.forEach(material => {
+            if (!material) return;
+            material.userData.blackKeyThreshold = value;
+            this.applyBlackKeyThresholdToMaterial(material);
+        });
+        this.emitStateChanged();
+    }
+
+    private applyBlackKeyThresholdToMaterial(material: THREE.Material) {
+        if (!(material instanceof THREE.MeshPhongMaterial)) {
+            return;
+        }
+
+        const userData = material.userData as {
+            alphaThresholdBaseAlphaTest?: number;
+            alphaThresholdBaseTransparent?: boolean;
+            alphaThresholdBaseDepthWrite?: boolean;
+            alphaThresholdBaseBlending?: THREE.Blending;
+            blackKeyThreshold?: number;
+        };
+
+        if (userData.alphaThresholdBaseAlphaTest === undefined) {
+            this.rememberMaterialAlphaDefaults(material);
+        }
+
+        const baseAlphaTest = userData.alphaThresholdBaseAlphaTest ?? 0;
+        const baseTransparent = userData.alphaThresholdBaseTransparent ?? material.transparent;
+        const baseDepthWrite = userData.alphaThresholdBaseDepthWrite ?? material.depthWrite;
+        const baseBlending = userData.alphaThresholdBaseBlending ?? material.blending;
+        const blackKeyThreshold = typeof userData.blackKeyThreshold === 'number' ? userData.blackKeyThreshold : 0;
+
+        if (!material.map || blackKeyThreshold <= 0) {
+            material.alphaMap = null;
+            material.alphaTest = baseAlphaTest;
+            material.transparent = baseTransparent;
+            material.depthWrite = baseDepthWrite;
+            material.blending = baseBlending;
+            material.needsUpdate = true;
+            return;
+        }
+
+        const alphaMap = this.ensureBlackKeyAlphaMap(material.map);
+        if (!alphaMap) {
+            material.alphaMap = null;
+            material.alphaTest = baseAlphaTest;
+            material.transparent = baseTransparent;
+            material.depthWrite = baseDepthWrite;
+            material.blending = baseBlending;
+            material.needsUpdate = true;
+            return;
+        }
+
+        material.alphaMap = alphaMap;
+        material.alphaTest = Math.max(baseAlphaTest, blackKeyThreshold);
+        material.transparent = baseTransparent;
+        material.depthWrite = baseDepthWrite;
+        material.blending = baseBlending;
+        material.needsUpdate = true;
     }
 
     /** Saves all unique material maps to PNG files */
@@ -1593,6 +2851,7 @@ class App {
             const currentSpeed = parseFloat(speedSlider.value);
             this.currentAction.setEffectiveTimeScale(currentSpeed);
             this.currentAction.reset().play();
+            this.currentAction.paused = !this.animationsEnabled;
         };
 
         animBox.appendChild(select);
@@ -1613,8 +2872,9 @@ class App {
 
     private animate = (time: DOMHighResTimeStamp) => {
         requestAnimationFrame(this.animate);
-        const delta = this.clock.getDelta();
-        if (!this.isActive) {
+        this.timer.update(time);
+        const delta = this.timer.getDelta();
+        if (!this.isActive || !this.rendererReady) {
             return;
         }
 
@@ -1629,7 +2889,7 @@ class App {
         if (this.mixer) {
             if (this.isFrameLocked) {
                 this.applyLockedFrame();
-            } else if (!this.isRecordingGif) {
+            } else if (this.animationsEnabled && !this.isRecordingGif) {
                 this.mixer.update(delta);
             }
         }
@@ -1736,11 +2996,17 @@ class App {
 
     private setBrightness(value: number) {
       const safeValue = Math.max(0.1, value);
-      this.renderer.toneMappingExposure = safeValue;
+      if (this.renderer) {
+        this.renderer.toneMappingExposure = safeValue;
+      }
       if (this.ambientLight) this.ambientLight.intensity = 0.48 * safeValue;
       if (this.hemisphereLight) this.hemisphereLight.intensity = 0.62 * safeValue;
       if (this.directionalLight) this.directionalLight.intensity = 1.85 * safeValue;
       if (this.rimLight) this.rimLight.intensity = 0.82 * safeValue;
+    }
+
+    private emitStateChanged() {
+        this.onStateChanged?.(this.getCurrentState());
     }
 
     // ========== NEW ATTACHMENT SYSTEM ==========
@@ -1841,22 +3107,18 @@ class App {
                 const foundCount = Object.keys(foundTextures).length;
 
                 if (foundCount > 0) {
-                    // Count total files (each texture name may have multiple files)
-                    const totalFiles = Object.values(foundTextures).reduce((sum, paths) => sum + paths.length, 0);
-                    logger.debug(`%c[Electron] Found ${foundCount} texture names (${totalFiles} files) for attachment, loading...`, 'color: #4CAF50');
+                    const texturePaths = selectPreferredTexturePaths(foundTextures, requiredTextures);
+                    logger.debug(`%c[Electron] Found ${foundCount} texture names for attachment, loading ${texturePaths.length} preferred files...`, 'color: #4CAF50');
 
-                    // Load each found texture file
-                    for (const [textureName, texturePaths] of Object.entries(foundTextures)) {
-                        for (const texturePath of texturePaths) {
-                            const fileData = await readFileFromPath(texturePath);
-                            if (fileData) {
-                                const file = createFileFromElectronData(fileData.name, fileData.data);
-                                await this.loadAndApplyTexture(file);
-                            }
+                    for (const texturePath of texturePaths) {
+                        const fileData = await readFileFromPath(texturePath);
+                        if (fileData) {
+                            const file = createFileFromElectronData(fileData.name, fileData.data);
+                            await this.loadAndApplyTexture(file, { promptOnUnmatched: false });
                         }
                     }
 
-                    logger.debug(`%c[Electron] Auto-loaded ${totalFiles} texture files for ${foundCount} base names`, 'color: #4CAF50');
+                    logger.debug(`%c[Electron] Auto-loaded ${texturePaths.length} texture files for ${foundCount} base names`, 'color: #4CAF50');
                 }
             } catch (error) {
                 logger.error('[Electron] Error auto-searching textures for attachment:', error);
@@ -2079,37 +3341,361 @@ class App {
     }
 }
 
-const app = new App();
-let characterScene: CharacterTestScene | null = null;
-let terrainScene: TerrainScene | null = null;
+const explorerStore = new ExplorerStateStore();
+const initialState = explorerStore.getState();
+const app = new App(initialState.bmd.rendererBackend);
+const characterScene = new CharacterTestScene();
+const terrainScene = new TerrainScene();
+initControlMenu();
 
-if (isElectron()) {
-    characterScene = new CharacterTestScene();
-    characterScene.setActive(false);
-} else {
-    const characterTab = document.querySelector<HTMLButtonElement>('.tab-btn[data-view="character"]');
-    if (characterTab) characterTab.style.display = 'none';
-
-    const sidebarCharacter = document.getElementById('sidebar-character');
-    if (sidebarCharacter) sidebarCharacter.classList.add('hidden');
-
-    const viewCharacter = document.getElementById('view-character');
-    if (viewCharacter) viewCharacter.classList.add('hidden');
-}
-
-terrainScene = new TerrainScene();
+characterScene.setActive(false);
 terrainScene.setActive(false);
 
 const tabButtons = document.querySelectorAll<HTMLButtonElement>('.tab-btn');
+const explorerSearchInput = document.getElementById('explorer-search') as HTMLInputElement | null;
+const explorerWorldsList = document.getElementById('explorer-worlds-list');
+const explorerBookmarksList = document.getElementById('explorer-bookmarks-list');
+const explorerCharactersList = document.getElementById('explorer-characters-list');
+const explorerModelsList = document.getElementById('explorer-models-list');
+const presentationToggle = document.getElementById('presentation-mode-toggle') as HTMLInputElement | null;
+const presentationOverlay = document.getElementById('presentation-overlay');
+const presentationExitBtn = document.getElementById('presentation-exit-btn') as HTMLButtonElement | null;
+let explorerSearch = '';
+
+function formatRelativeTime(timestamp: number): string {
+    const deltaMs = Math.max(0, Date.now() - timestamp);
+    const deltaMinutes = Math.floor(deltaMs / 60000);
+    if (deltaMinutes < 1) return 'just now';
+    if (deltaMinutes < 60) return `${deltaMinutes}m ago`;
+    const deltaHours = Math.floor(deltaMinutes / 60);
+    if (deltaHours < 24) return `${deltaHours}h ago`;
+    const deltaDays = Math.floor(deltaHours / 24);
+    return `${deltaDays}d ago`;
+}
+
+function switchToView(target: ViewerTab) {
+    const button = document.querySelector<HTMLButtonElement>(`.tab-btn[data-view="${target}"]`);
+    button?.click();
+}
+
+function syncPresentationMode(enabled: boolean) {
+    document.body.classList.toggle('presentation-mode', enabled);
+    if (presentationToggle) {
+        presentationToggle.checked = enabled;
+    }
+    presentationOverlay?.classList.toggle('hidden', !enabled);
+    presentationExitBtn?.classList.toggle('hidden', !enabled);
+    app.applyPresentationMode(enabled);
+    characterScene.applyPresentationMode(enabled);
+    terrainScene.applyPresentationMode(enabled);
+    updatePresentationOverlay();
+}
+
+function updatePresentationOverlay() {
+    if (!presentationOverlay) return;
+    const state = explorerStore.getState();
+    const parts: string[] = [];
+    if (state.activeView === 'terrain') {
+        const worldLabel = state.terrain.lastWorldNumber !== null ? `World ${state.terrain.lastWorldNumber}` : 'World Viewer';
+        parts.push(worldLabel);
+        if (state.terrain.selectedObject?.displayName) {
+            parts.push(state.terrain.selectedObject.displayName);
+        }
+    } else if (state.activeView === 'character') {
+        const presetLabel = state.characterPresets.find(preset =>
+            preset.classValue === state.character.classValue &&
+            preset.equipment.helm === state.character.equipment.helm,
+        )?.name;
+        parts.push(presetLabel || 'Character Preview');
+    } else {
+        parts.push(state.bmd.lastModelName || 'Model Viewer');
+    }
+    presentationOverlay.textContent = parts.join(' • ');
+}
+
+function createExplorerEmpty(message: string): HTMLElement {
+    const empty = document.createElement('div');
+    empty.className = 'explorer-item-empty';
+    empty.textContent = message;
+    return empty;
+}
+
+function createActionButton(label: string, onClick: () => void, className = ''): HTMLButtonElement {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `explorer-item-btn ${className}`.trim();
+    button.textContent = label;
+    button.addEventListener('click', event => {
+        event.stopPropagation();
+        onClick();
+    });
+    return button;
+}
+
+function matchesExplorerSearch(label: string, meta = ''): boolean {
+    const query = explorerSearch.trim().toLowerCase();
+    if (!query) return true;
+    return `${label} ${meta}`.toLowerCase().includes(query);
+}
+
+function renderExplorerList(container: HTMLElement | null, items: HTMLElement[], emptyMessage: string) {
+    if (!container) return;
+    container.innerHTML = '';
+    if (items.length === 0) {
+        container.appendChild(createExplorerEmpty(emptyMessage));
+        return;
+    }
+    items.forEach(item => container.appendChild(item));
+}
+
+function renderWorldSelector(container: HTMLElement | null, worldNumbers: number[], selectedWorldNumber: number | null) {
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (worldNumbers.length === 0) {
+        container.appendChild(createExplorerEmpty('No worlds loaded yet.'));
+        return;
+    }
+
+    const row = document.createElement('div');
+    row.className = 'row-inline';
+
+    const select = document.createElement('select');
+    select.className = 'animation-dropdown full-width';
+    worldNumbers.forEach(worldNumber => {
+        const option = document.createElement('option');
+        option.value = `${worldNumber}`;
+        option.textContent = `World ${worldNumber}`;
+        if (selectedWorldNumber === worldNumber) {
+            option.selected = true;
+        }
+        select.appendChild(option);
+    });
+
+    const openButton = createActionButton('Open', () => {
+        const worldNumber = parseInt(select.value, 10);
+        if (Number.isNaN(worldNumber)) return;
+        switchToView('terrain');
+        void terrainScene.loadWorldByNumber(worldNumber);
+    });
+
+    row.appendChild(select);
+    row.appendChild(openButton);
+    container.appendChild(row);
+}
+
+async function openRecentModel(entry: RecentModelEntry) {
+    if (entry.modelFileKey) {
+        const file = terrainScene.resolveModelFile(entry.modelFileKey);
+        if (file) {
+            switchToView('bmd');
+            await app.openModelFile(file, {
+                label: entry.label,
+                modelFileKey: entry.modelFileKey,
+                sourceWorldNumber: entry.sourceWorldNumber,
+                textureFiles: terrainScene.getCurrentTextureFiles(),
+            });
+            return;
+        }
+    }
+
+    switchToView('bmd');
+    app.setStatusMessage(`Model "${entry.label}" is not currently available. Reload the relevant world data first.`);
+}
+
+async function openBookmark(bookmark: ExplorerBookmark) {
+    switchToView('terrain');
+    const opened = await terrainScene.jumpToBookmark(bookmark);
+    if (opened) {
+        explorerStore.pushRecentBookmark({
+            bookmarkId: bookmark.id,
+            label: bookmark.name,
+            timestamp: Date.now(),
+        });
+        explorerStore.setTerrainState(terrainScene.getCurrentState());
+    }
+}
+
+function renderExplorer() {
+    const state = explorerStore.getState();
+    const recentWorldLookup = new Map(state.recentWorlds.map((entry, index) => [entry.worldNumber, { entry, index }]));
+    const worldCandidates = new Set<number>(state.recentWorlds.map(entry => entry.worldNumber));
+    state.terrain.availableWorldNumbers.forEach(worldNumber => worldCandidates.add(worldNumber));
+
+    const worldNumbers = [...worldCandidates]
+        .sort((a, b) => {
+            const recentA = recentWorldLookup.get(a);
+            const recentB = recentWorldLookup.get(b);
+            if (recentA && recentB) return recentA.index - recentB.index;
+            if (recentA) return -1;
+            if (recentB) return 1;
+            return a - b;
+        })
+        .filter(worldNumber => matchesExplorerSearch(
+            `World ${worldNumber}`,
+            recentWorldLookup.get(worldNumber)?.entry ? `recent ${formatRelativeTime(recentWorldLookup.get(worldNumber)!.entry.timestamp)}` : '',
+        ));
+
+    const bookmarkItems = state.bookmarks
+        .slice()
+        .sort((a, b) => {
+            const recentA = state.recentBookmarks.findIndex(entry => entry.bookmarkId === a.id);
+            const recentB = state.recentBookmarks.findIndex(entry => entry.bookmarkId === b.id);
+            const hasRecentA = recentA >= 0;
+            const hasRecentB = recentB >= 0;
+            if (hasRecentA && hasRecentB) return recentA - recentB;
+            if (hasRecentA) return -1;
+            if (hasRecentB) return 1;
+            return b.updatedAt - a.updatedAt;
+        })
+        .filter(bookmark => matchesExplorerSearch(bookmark.name, `world ${bookmark.worldNumber}`))
+        .map(bookmark => {
+            const recentEntry = state.recentBookmarks.find(entry => entry.bookmarkId === bookmark.id);
+            const item = document.createElement('div');
+            item.className = 'explorer-item';
+            const label = document.createElement('div');
+            label.className = 'explorer-item-label';
+            label.innerHTML = recentEntry
+                ? `${bookmark.name}<span class="explorer-item-meta">World ${bookmark.worldNumber} • Recent ${formatRelativeTime(recentEntry.timestamp)}</span>`
+                : `${bookmark.name}<span class="explorer-item-meta">World ${bookmark.worldNumber}</span>`;
+            item.appendChild(label);
+            item.appendChild(createActionButton('Open', () => { void openBookmark(bookmark); }));
+            item.appendChild(createActionButton('Rename', () => {
+                const name = window.prompt('Rename bookmark', bookmark.name)?.trim();
+                if (!name) return;
+                explorerStore.renameBookmark(bookmark.id, name);
+            }));
+            item.appendChild(createActionButton('Delete', () => {
+                explorerStore.deleteBookmark(bookmark.id);
+            }, 'is-danger'));
+            return item;
+        });
+
+    const presetItems = state.characterPresets
+        .filter(preset => matchesExplorerSearch(preset.name, `class ${preset.classValue}`))
+        .map(preset => {
+            const item = document.createElement('div');
+            item.className = 'explorer-item';
+            const label = document.createElement('div');
+            label.className = 'explorer-item-label';
+            label.innerHTML = `${preset.pinned ? '★ ' : ''}${preset.name}<span class="explorer-item-meta">Class ${preset.classValue}</span>`;
+            item.appendChild(label);
+            item.appendChild(createActionButton('Apply', () => {
+                switchToView('character');
+                characterScene.applyCharacterPreset(preset);
+            }));
+            item.appendChild(createActionButton(preset.pinned ? 'Unpin' : 'Pin', () => {
+                explorerStore.toggleCharacterPresetPinned(preset.id);
+            }));
+            item.appendChild(createActionButton('Delete', () => {
+                explorerStore.deleteCharacterPreset(preset.id);
+            }, 'is-danger'));
+            return item;
+        });
+
+    const modelItems = state.recentModels
+        .filter(entry => matchesExplorerSearch(entry.label, entry.modelFileKey || ''))
+        .map(entry => {
+            const item = document.createElement('div');
+            item.className = 'explorer-item';
+            const label = document.createElement('div');
+            label.className = 'explorer-item-label';
+            label.innerHTML = `${entry.label}<span class="explorer-item-meta">${entry.modelFileKey || 'Transient file'}</span>`;
+            item.appendChild(label);
+            item.appendChild(createActionButton('Open', () => { void openRecentModel(entry); }));
+            return item;
+        });
+
+    renderWorldSelector(explorerWorldsList, worldNumbers, state.terrain.lastWorldNumber);
+    renderExplorerList(explorerBookmarksList, bookmarkItems, 'No bookmarks saved.');
+    renderExplorerList(explorerCharactersList, presetItems, 'No character presets saved.');
+    renderExplorerList(explorerModelsList, modelItems, 'No recent models.');
+    updatePresentationOverlay();
+}
+
+presentationToggle?.addEventListener('change', () => {
+    explorerStore.setPresentationMode(!!presentationToggle.checked);
+});
+presentationExitBtn?.addEventListener('click', () => {
+    explorerStore.setPresentationMode(false);
+});
+explorerSearchInput?.addEventListener('input', () => {
+    explorerSearch = explorerSearchInput.value;
+    renderExplorer();
+});
+
+app.onStateChanged = state => {
+    explorerStore.setBmdState(state);
+};
+app.onModelLoaded = entry => {
+    explorerStore.pushRecentModel(entry);
+    explorerStore.setBmdState(app.getCurrentState());
+};
+characterScene.onStateChanged = state => {
+    explorerStore.setCharacterState(state);
+};
+characterScene.onPresetSaveRequested = preset => {
+    explorerStore.upsertCharacterPreset(preset);
+};
+terrainScene.onCameraChanged = () => {
+    explorerStore.setTerrainState(terrainScene.getCurrentState());
+};
+terrainScene.onStateChanged = state => {
+    explorerStore.setTerrainState(state);
+};
+terrainScene.onObjectSelected = () => {
+    explorerStore.setTerrainState(terrainScene.getCurrentState());
+};
+terrainScene.onWorldLoaded = (worldNumber) => {
+    explorerStore.pushRecentWorld({
+        worldNumber,
+        label: `World ${worldNumber}`,
+        timestamp: Date.now(),
+    });
+    explorerStore.setTerrainState(terrainScene.getCurrentState());
+};
+terrainScene.onBookmarkCreated = bookmark => {
+    explorerStore.upsertBookmark(bookmark);
+    explorerStore.pushRecentBookmark({
+        bookmarkId: bookmark.id,
+        label: bookmark.name,
+        timestamp: Date.now(),
+    });
+};
+terrainScene.onOpenModelRequest = (selection, modelFile) => {
+    if (!modelFile) {
+        terrainScene.setStatusMessage(`Model for "${selection.displayName}" is not available in current world files.`);
+        return;
+    }
+    switchToView('bmd');
+    void app.openModelFile(modelFile, {
+        label: selection.displayName,
+        modelFileKey: selection.modelFileKey,
+        sourceWorldNumber: selection.worldNumber,
+        textureFiles: terrainScene.getCurrentTextureFiles(),
+    });
+};
+
+explorerStore.subscribe(() => {
+    renderExplorer();
+    const snapshot = explorerStore.getState();
+    syncPresentationMode(snapshot.presentationMode);
+});
+
 tabButtons.forEach(btn => {
     btn.addEventListener('click', () => {
-        const target = btn.dataset.view || 'bmd';
+        const target = (btn.dataset.view || 'bmd') as ViewerTab;
+        explorerStore.setActiveView(target);
         app.setActive(target === 'bmd');
-        if (characterScene) {
-            characterScene.setActive(target === 'character');
-        }
-        if (terrainScene) {
-            terrainScene.setActive(target === 'terrain');
-        }
+        characterScene.setActive(target === 'character');
+        terrainScene.setActive(target === 'terrain');
+        updatePresentationOverlay();
     });
 });
+
+app.restoreSessionState(initialState.bmd);
+characterScene.restoreSessionState(initialState.character);
+terrainScene.restoreSessionState(initialState.terrain);
+syncPresentationMode(initialState.presentationMode);
+switchToView(initialState.activeView);
+renderExplorer();

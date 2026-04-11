@@ -1,8 +1,11 @@
-// src/terrain/TerrainObjects.ts
 import * as THREE from 'three';
 import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { BMDLoader } from '../bmd-loader';
+import { BMDLoader, convertTgaToDataUrl } from '../bmd-loader';
 import { convertOzjToDataUrl } from '../ozj-loader';
+import type { SelectedWorldObjectRef } from '../explorer-types';
+import { DEFAULT_ANIMATION_PLAYBACK_SPEED } from '../animation-settings';
+import { createWorldObjectId } from './TerrainExplorerUtils';
+import { canUseInstancedStaticObjects } from './TerrainAnimationUtils';
 import type { OBJData, MapObject } from './formats/OBJReader';
 import { TERRAIN_WORLD_SIZE } from './TerrainMesh';
 import {
@@ -10,6 +13,36 @@ import {
     detectBlendModeFromTexture,
     type BlendHeuristicResult,
 } from '../utils/TextureBlendHeuristics';
+import { selectTerrainObjectTextureCandidates } from './TerrainObjectTextureSelection';
+
+export interface TerrainObjectDefinition {
+    type: number;
+    mapNumber: number;
+    modelName: string | null;
+    modelFileKey: string | null;
+    modelFile: File | null;
+}
+
+export interface TerrainObjectSelectionRecord {
+    selection: SelectedWorldObjectRef;
+    modelFile: File | null;
+    approximateRadius: number;
+    object3D: THREE.Object3D | null;
+    instancedMesh: THREE.InstancedMesh | null;
+    instanceId: number | null;
+}
+
+export interface TerrainObjectLoadResult {
+    group: THREE.Group;
+    records: TerrainObjectSelectionRecord[];
+    animatedInstances: TerrainAnimatedObjectInstance[];
+}
+
+export interface TerrainAnimatedObjectInstance {
+    object3D: THREE.Object3D;
+    mixer: THREE.AnimationMixer;
+    worldPosition: THREE.Vector3;
+}
 
 // World 1 object type-to-name mapping.
 // Source: MU client object registry (Lorencia object table).
@@ -153,7 +186,7 @@ export async function loadTerrainObjects(
     files: Map<string, File>,
     mapNumber: number,
     onProgress?: (loaded: number, total: number) => void,
-): Promise<THREE.Group> {
+): Promise<TerrainObjectLoadResult> {
     const group = new THREE.Group();
     group.name = 'terrain_objects';
     group.matrixAutoUpdate = false;
@@ -163,6 +196,8 @@ export async function loadTerrainObjects(
     const textureLoader = new THREE.TextureLoader();
     const textureCache = new Map<string, THREE.Texture>();
     const blendCache = new Map<string, BlendHeuristicResult>();
+    const records: TerrainObjectSelectionRecord[] = [];
+    const animatedInstances: TerrainAnimatedObjectInstance[] = [];
 
     // Group objects by type for instancing
     const byType = new Map<number, MapObject[]>();
@@ -183,8 +218,8 @@ export async function loadTerrainObjects(
 
     // Load each unique object type once
     for (const [type, instances] of byType) {
-        const bmdFile = findObjectBMD(files, type, mapNumber);
-        if (!bmdFile) {
+        const definition = resolveTerrainObjectDefinition(files, type, mapNumber);
+        if (!definition.modelFile) {
             console.warn(`  [type ${type}] missing ${buildMissingObjectHint(type, mapNumber)}`);
             missingCount++;
             loaded++;
@@ -194,33 +229,81 @@ export async function loadTerrainObjects(
         foundCount++;
 
         try {
-            const buf = await bmdFile.arrayBuffer();
+            const buf = await definition.modelFile.arrayBuffer();
             const { group: template, requiredTextures } = await bmdLoader.load(buf);
             const baseOrientation = template.quaternion.clone();
-
+            const approximateRadius = getTemplateApproximateRadius(template);
             // Try to load textures for this object
             for (const texName of requiredTextures) {
                 await tryApplyTexture(template, texName, files, textureLoader, textureCache, blendCache);
             }
 
             // Place instances. Prefer GPU instancing for static meshes.
-            const instanced = addInstancedStaticObjects(group, template, instances, baseOrientation);
+            const instanced = addInstancedStaticObjects(
+                group,
+                template,
+                instances,
+                baseOrientation,
+                definition,
+                approximateRadius,
+                records,
+            );
+
             if (!instanced) {
                 for (const inst of instances) {
                     // Skinned meshes must be cloned with SkeletonUtils to avoid
                     // sharing one skeleton across all instances.
                     const clone = SkeletonUtils.clone(template);
-                    clone.position.set(inst.position.x, inst.position.z, TERRAIN_WORLD_SIZE - inst.position.y);
+                    const worldPosition = mapObjectToWorldPosition(inst);
+                    clone.position.copy(worldPosition);
                     // Reference clients apply map-object rotation on top of
                     // model base orientation. Keep template orientation and
                     // multiply by OBJ rotation quaternion.
                     const objQuat = mapObjectAngleToQuaternion(inst.angle);
                     clone.quaternion.copy(objQuat.multiply(baseOrientation));
                     clone.scale.setScalar(inst.scale);
+                    clone.animations = template.animations;
                     clone.updateMatrix();
-                    clone.updateMatrixWorld(true);
                     clone.matrixAutoUpdate = false;
+                    clone.updateMatrixWorld(true);
+
+                    // Pre-compute world-space bounding sphere for frustum culling.
+                    const box = new THREE.Box3().setFromObject(clone);
+                    const bs = new THREE.Sphere();
+                    box.getBoundingSphere(bs);
+                    clone.userData.cullBoundingSphere = bs;
+
                     group.add(clone);
+
+                    const record = createSelectionRecord(
+                        definition,
+                        inst,
+                        worldPosition,
+                        approximateRadius,
+                        clone,
+                        null,
+                        null,
+                    );
+                    clone.userData.terrainObjectRecord = record;
+                    clone.traverse(obj => {
+                        if ((obj as THREE.Mesh).isMesh) {
+                            obj.userData.terrainObjectRecord = record;
+                        }
+                    });
+                    records.push(record);
+
+                    const defaultClip = clone.animations[0];
+                    if (defaultClip) {
+                        const mixer = new THREE.AnimationMixer(clone);
+                        const action = mixer.clipAction(defaultClip);
+                        action.setEffectiveTimeScale(DEFAULT_ANIMATION_PLAYBACK_SPEED);
+                        action.reset().play();
+                        animatedInstances.push({
+                            object3D: clone,
+                            mixer,
+                            worldPosition: worldPosition.clone(),
+                        });
+                    }
                 }
             }
         } catch (e) {
@@ -234,49 +317,86 @@ export async function loadTerrainObjects(
     console.log(`BMDs found: ${foundCount}, missing: ${missingCount}`);
     console.groupEnd();
 
-    return group;
+    return { group, records, animatedInstances };
 }
 
-function findObjectBMD(files: Map<string, File>, type: number, mapNumber: number): File | null {
+export function resolveTerrainObjectDefinition(
+    files: Map<string, File>,
+    type: number,
+    mapNumber: number,
+): TerrainObjectDefinition {
     // Priority 1: canonical numeric file name used by many clients.
     const fileIdx = type + 1;
     const padded = fileIdx.toString().padStart(2, '0');
     const numericCandidates = [`Object${padded}`, `Object${fileIdx}`];
     const numericFile = findObjectBMDCandidate(files, mapNumber, numericCandidates);
-    if (numericFile) return numericFile;
+    if (numericFile) {
+        return {
+            type,
+            mapNumber,
+            modelName: numericFile.baseName,
+            modelFileKey: numericFile.key,
+            modelFile: numericFile.file,
+        };
+    }
 
     // Priority 2: world-specific object table mapping (e.g. Lorencia names).
     const mappedName = WORLD_OBJECT_NAME_BY_TYPE[mapNumber]?.[type];
     if (mappedName) {
         const aliases = OBJECT_NAME_ALIASES[mappedName.toLowerCase()] || [];
         const mappedFile = findObjectBMDCandidate(files, mapNumber, [mappedName, ...aliases]);
-        if (mappedFile) return mappedFile;
-    }
-
-    // Priority 3: global fallback for ObjectNN names outside expected folder.
-    for (const [name, file] of files) {
-        const lower = name.toLowerCase();
-        if (lower.endsWith(`/object${padded}.bmd`) || lower.endsWith(`/object${fileIdx}.bmd`)) {
-            return file;
+        if (mappedFile) {
+            return {
+                type,
+                mapNumber,
+                modelName: mappedFile.baseName || mappedName,
+                modelFileKey: mappedFile.key,
+                modelFile: mappedFile.file,
+            };
         }
     }
 
-    return null;
+    // Priority 3: global fallback for ObjectNN names outside expected folder.
+    for (const [key, file] of files) {
+        const lower = key.toLowerCase();
+        if (lower.endsWith(`/object${padded}.bmd`) || lower.endsWith(`/object${fileIdx}.bmd`)) {
+            const baseName = lower.split('/').pop()!.replace(/\.bmd$/i, '');
+            return {
+                type,
+                mapNumber,
+                modelName: baseName,
+                modelFileKey: key,
+                modelFile: file,
+            };
+        }
+    }
+
+    return {
+        type,
+        mapNumber,
+        modelName: mappedName || null,
+        modelFileKey: null,
+        modelFile: null,
+    };
 }
 
-function findObjectBMDCandidate(files: Map<string, File>, mapNumber: number, candidates: string[]): File | null {
+function findObjectBMDCandidate(
+    files: Map<string, File>,
+    mapNumber: number,
+    candidates: string[],
+): { key: string; file: File; baseName: string } | null {
     const folder = `object${mapNumber}/`;
     const normalizedCandidates = new Set(candidates.map(normalizeObjectBaseName));
 
-    for (const [name, file] of files) {
-        const lower = name.toLowerCase();
+    for (const [key, file] of files) {
+        const lower = key.toLowerCase();
         if (!lower.startsWith(folder) || !lower.endsWith('.bmd')) {
             continue;
         }
 
         const baseName = lower.split('/').pop()!.replace(/\.bmd$/i, '');
         if (normalizedCandidates.has(normalizeObjectBaseName(baseName))) {
-            return file;
+            return { key, file, baseName };
         }
     }
 
@@ -295,6 +415,63 @@ function buildMissingObjectHint(type: number, mapNumber: number): string {
         return `Object${mapNumber}/${mappedName}.bmd`;
     }
     return `Object${mapNumber}/Object${padded}.bmd`;
+}
+
+function getTemplateApproximateRadius(template: THREE.Object3D): number {
+    const box = new THREE.Box3().setFromObject(template);
+    if (!Number.isFinite(box.min.x) || !Number.isFinite(box.max.x)) {
+        return 150;
+    }
+    const size = box.getSize(new THREE.Vector3());
+    return Math.max(120, Math.max(size.x, size.y, size.z) * 0.45);
+}
+
+function createSelectionRecord(
+    definition: TerrainObjectDefinition,
+    instance: MapObject,
+    worldPosition: THREE.Vector3,
+    approximateRadius: number,
+    object3D: THREE.Object3D | null,
+    instancedMesh: THREE.InstancedMesh | null,
+    instanceId: number | null,
+): TerrainObjectSelectionRecord {
+    const modelName = definition.modelName;
+    const displayName = modelName ? `${modelName} · type ${definition.type}` : `Type ${definition.type}`;
+    const objectId = createWorldObjectId(definition.mapNumber, definition.type, {
+        x: worldPosition.x,
+        z: worldPosition.z,
+    });
+
+    return {
+        selection: {
+            objectId,
+            worldNumber: definition.mapNumber,
+            type: definition.type,
+            modelName,
+            modelFileKey: definition.modelFileKey,
+            displayName,
+            position: {
+                x: worldPosition.x,
+                y: worldPosition.y,
+                z: worldPosition.z,
+            },
+            rotation: {
+                x: instance.angle.x,
+                y: instance.angle.y,
+                z: instance.angle.z,
+            },
+            scale: instance.scale,
+        },
+        modelFile: definition.modelFile,
+        approximateRadius: approximateRadius * Math.max(instance.scale, 0.001),
+        object3D,
+        instancedMesh,
+        instanceId,
+    };
+}
+
+function mapObjectToWorldPosition(inst: MapObject): THREE.Vector3 {
+    return new THREE.Vector3(inst.position.x, inst.position.z, TERRAIN_WORLD_SIZE - inst.position.y);
 }
 
 function mapObjectAngleToQuaternion(angle: { x: number; y: number; z: number }): THREE.Quaternion {
@@ -352,6 +529,9 @@ function addInstancedStaticObjects(
     template: THREE.Group,
     instances: MapObject[],
     baseOrientation: THREE.Quaternion,
+    definition: TerrainObjectDefinition,
+    approximateRadius: number,
+    records: TerrainObjectSelectionRecord[],
 ): boolean {
     const templateMeshes: THREE.Mesh[] = [];
     let hasSkinnedMeshes = false;
@@ -364,7 +544,11 @@ function addInstancedStaticObjects(
         }
     });
 
-    if (templateMeshes.length === 0 || hasSkinnedMeshes) {
+    if (!canUseInstancedStaticObjects({
+        meshCount: templateMeshes.length,
+        hasSkinnedMeshes,
+        animationCount: template.animations.length,
+    })) {
         return false;
     }
 
@@ -372,23 +556,33 @@ function addInstancedStaticObjects(
     const templateWorldInverse = new THREE.Matrix4().copy(template.matrixWorld).invert();
 
     const useChunking = instances.length >= OBJECT_INSTANCE_CHUNK_THRESHOLD;
-    const chunkedObjectMatrices = new Map<string, THREE.Matrix4[]>();
+    const chunkedItems = new Map<string, Array<{ instance: MapObject; matrix: THREE.Matrix4; record: TerrainObjectSelectionRecord }>>();
     const position = new THREE.Vector3();
     const scale = new THREE.Vector3();
     for (let i = 0; i < instances.length; i++) {
         const inst = instances[i];
-        position.set(inst.position.x, inst.position.z, TERRAIN_WORLD_SIZE - inst.position.y);
+        position.copy(mapObjectToWorldPosition(inst));
         const rotation = mapObjectAngleToQuaternion(inst.angle).multiply(baseOrientation);
         scale.setScalar(inst.scale);
         const objectMatrix = new THREE.Matrix4().compose(position, rotation, scale);
         const chunkKey = useChunking
             ? getObjectChunkKey(position.x, position.z)
             : 'all';
-        const chunk = chunkedObjectMatrices.get(chunkKey);
+        const record = createSelectionRecord(
+            definition,
+            inst,
+            position,
+            approximateRadius,
+            null,
+            null,
+            null,
+        );
+        const chunk = chunkedItems.get(chunkKey);
+        const item = { instance: inst, matrix: objectMatrix, record };
         if (chunk) {
-            chunk.push(objectMatrix);
+            chunk.push(item);
         } else {
-            chunkedObjectMatrices.set(chunkKey, [objectMatrix]);
+            chunkedItems.set(chunkKey, [item]);
         }
     }
 
@@ -399,11 +593,11 @@ function addInstancedStaticObjects(
             .copy(templateWorldInverse)
             .multiply(srcMesh.matrixWorld);
 
-        for (const [chunkKey, objectMatrices] of chunkedObjectMatrices) {
+        for (const [chunkKey, chunkItems] of chunkedItems) {
             const instancedMesh = new THREE.InstancedMesh(
                 srcMesh.geometry,
                 srcMesh.material,
-                objectMatrices.length,
+                chunkItems.length,
             );
             const baseName = srcMesh.name || 'terrain_instanced_mesh';
             instancedMesh.name = `${baseName}_${chunkKey}`;
@@ -413,11 +607,17 @@ function addInstancedStaticObjects(
             instancedMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
             instancedMesh.matrixAutoUpdate = false;
 
-            for (let i = 0; i < objectMatrices.length; i++) {
-                finalMatrix.multiplyMatrices(objectMatrices[i], meshLocalFromTemplate);
+            const chunkRecords: TerrainObjectSelectionRecord[] = [];
+            for (let i = 0; i < chunkItems.length; i++) {
+                finalMatrix.multiplyMatrices(chunkItems[i].matrix, meshLocalFromTemplate);
                 instancedMesh.setMatrixAt(i, finalMatrix);
+                chunkItems[i].record.instancedMesh = instancedMesh;
+                chunkItems[i].record.instanceId = i;
+                chunkRecords.push(chunkItems[i].record);
+                records.push(chunkItems[i].record);
             }
 
+            instancedMesh.userData.terrainObjectRecords = chunkRecords;
             instancedMesh.instanceMatrix.needsUpdate = true;
             instancedMesh.computeBoundingBox();
             instancedMesh.computeBoundingSphere();
@@ -454,10 +654,19 @@ async function tryApplyTexture(
             const wantedBase = mesh.userData.texturePath.split(/[\\/]/).pop()!.replace(/\.[^.]+$/, '');
             if (normalizeObjectBaseName(wantedBase) !== cacheKey) return;
 
-            const mat = mesh.material as THREE.MeshPhongMaterial;
-            mat.map = texture;
-            mat.color.set(0xffffff);
-            applyBlendModeToMaterial(mat, blend);
+            const material = mesh.material;
+            const applyMaterial = (mat: THREE.Material) => {
+                const phongMaterial = mat as THREE.MeshPhongMaterial;
+                phongMaterial.map = texture;
+                phongMaterial.color.set(0xffffff);
+                applyBlendModeToMaterial(phongMaterial, blend);
+            };
+
+            if (Array.isArray(material)) {
+                material.forEach(applyMaterial);
+            } else if (material) {
+                applyMaterial(material);
+            }
         });
     };
 
@@ -468,30 +677,55 @@ async function tryApplyTexture(
         return;
     }
 
-    for (const [name, file] of files) {
-        const fBaseRaw = name.split(/[\\/]/).pop()!.replace(/\.[^.]+$/, '');
-        if (normalizeObjectBaseName(fBaseRaw) === cacheKey) {
-            try {
-                const ext = file.name.split('.').pop()!.toLowerCase();
-                let url: string;
-                if (ext === 'ozj' || ext === 'ozt') {
-                    url = await convertOzjToDataUrl(await file.arrayBuffer(), ext as 'ozj' | 'ozt');
-                } else {
-                    url = URL.createObjectURL(file);
-                }
-                const tex = await textureLoader.loadAsync(url);
-                tex.colorSpace = THREE.SRGBColorSpace;
-                tex.wrapS = THREE.RepeatWrapping;
-                tex.wrapT = THREE.RepeatWrapping;
-                tex.flipY = false;
+    const candidates = selectTerrainObjectTextureCandidates(
+        texName,
+        Array.from(files, ([name, file]) => ({ name, file })),
+        candidate => candidate.name,
+    );
 
-                const blendResult = detectBlendModeFromTexture(tex, `${baseNameRaw} ${name}`);
-                tex.userData.blendHeuristic = blendResult;
-                textureCache.set(cacheKey, tex);
-                blendCache.set(cacheKey, blendResult);
-                applyToGroup(tex, blendResult);
-                return;
-            } catch { /* skip */ }
+    for (const candidate of candidates) {
+        try {
+            const tex = await loadTerrainObjectTextureFile(candidate.file, textureLoader);
+            const blendResult = detectBlendModeFromTexture(tex, `${baseNameRaw} ${candidate.name}`);
+            tex.userData.blendHeuristic = blendResult;
+            textureCache.set(cacheKey, tex);
+            blendCache.set(cacheKey, blendResult);
+            applyToGroup(tex, blendResult);
+            return;
+        } catch {
+            // Skip and try next compatible texture candidate.
+        }
+    }
+}
+
+async function loadTerrainObjectTextureFile(
+    file: File,
+    textureLoader: THREE.TextureLoader,
+): Promise<THREE.Texture> {
+    const ext = file.name.split('.').pop()!.toLowerCase();
+    let url: string;
+    let objectUrl: string | null = null;
+
+    if (ext === 'tga') {
+        url = await convertTgaToDataUrl(await file.arrayBuffer());
+    } else if (ext === 'ozj' || ext === 'ozt') {
+        url = await convertOzjToDataUrl(await file.arrayBuffer());
+    } else {
+        objectUrl = URL.createObjectURL(file);
+        url = objectUrl;
+    }
+
+    try {
+        const tex = await textureLoader.loadAsync(url);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.flipY = false;
+        tex.name = file.name;
+        return tex;
+    } finally {
+        if (objectUrl) {
+            URL.revokeObjectURL(objectUrl);
         }
     }
 }

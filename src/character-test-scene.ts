@@ -5,9 +5,18 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { BMDLoader, convertTgaToDataUrl } from './bmd-loader';
 import { convertOzjToDataUrl } from './ozj-loader';
 import { isElectron, openDirectoryDialog, readFileFromPath, searchTextures } from './electron-helper';
+import type { CharacterPreset, CharacterSessionState } from './explorer-types';
+import { createId } from './explorer-store';
 import { parseItemBmd, ItemDefinition } from './item-bmd';
 import { SkinnedVertexNormalsHelper } from './helpers/SkinnedVertexNormalsHelper';
 import { Disposer } from './utils/Disposer';
+import { resolveAttachmentBoneByBmdIndex } from './utils/CharacterAttachmentBones';
+import {
+  disposeCharacterItemAnimations,
+  startCharacterItemAnimation,
+  updateCharacterItemAnimationSpeed,
+  type CharacterItemAnimationPlayback,
+} from './utils/CharacterItemAnimations';
 import { applyBlendModeToMaterial, detectBlendModeFromTexture, type BlendHeuristicResult } from './utils/TextureBlendHeuristics';
 import GIF from 'gif.js';
 import gifWorkerUrl from 'gif.js/dist/gif.worker.js?url';
@@ -104,11 +113,14 @@ function formatClassId(value: number): string {
 }
 
 export class CharacterTestScene {
+  public onStateChanged?: (state: CharacterSessionState) => void;
+  public onPresetSaveRequested?: (preset: CharacterPreset) => void;
+
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
   private renderer!: THREE.WebGLRenderer;
   private controls!: OrbitControls;
-  private clock = new THREE.Clock();
+  private timer = new THREE.Timer();
   private ambientLight!: THREE.AmbientLight;
   private hemisphereLight!: THREE.HemisphereLight;
   private directionalLight!: THREE.DirectionalLight;
@@ -116,6 +128,7 @@ export class CharacterTestScene {
 
   private mixer: THREE.AnimationMixer | null = null;
   private currentAction: THREE.AnimationAction | null = null;
+  private itemAnimationPlaybacks: CharacterItemAnimationPlayback[] = [];
 
   private readonly bmdLoader = new BMDLoader();
   private textureLoader = new THREE.TextureLoader();
@@ -131,6 +144,7 @@ export class CharacterTestScene {
 
   private characterRoot: THREE.Group | null = null;
   private baseSkeleton: THREE.Skeleton | null = null;
+  private baseBmdBones: THREE.Bone[] | null = null;
   private baseBindMatrix: THREE.Matrix4 | null = null;
   private characterOffset = new THREE.Vector3();
   private readonly characterHeightOffset = 80;
@@ -160,6 +174,8 @@ export class CharacterTestScene {
   private isAutoRotating = true;
   private userIsInteracting = false;
   private buildToken = 0;
+  private pendingSessionState: CharacterSessionState | null = null;
+  private presentationMode = false;
 
   private containerEl!: HTMLElement;
   private dataDropZone!: HTMLElement;
@@ -202,6 +218,8 @@ export class CharacterTestScene {
   private brightnessSlider!: HTMLInputElement;
   private brightnessLabel!: HTMLElement;
   private statusEl!: HTMLElement;
+  private presetNameInput!: HTMLInputElement;
+  private presetStatusEl!: HTMLElement;
 
   constructor() {
     this.initThree();
@@ -212,8 +230,123 @@ export class CharacterTestScene {
   public setActive(active: boolean) {
     this.isActive = active;
     if (active) {
+      this.timer.reset();
       this.refreshViewport();
     }
+  }
+
+  public setStatusMessage(message: string) {
+    this.statusEl.textContent = message;
+  }
+
+  public applyPresentationMode(enabled: boolean) {
+    this.presentationMode = enabled;
+    if (this.gridHelper) {
+      this.gridHelper.visible = !enabled;
+    }
+    if (enabled) {
+      if (this.skeletonHelper) this.skeletonHelper.visible = false;
+      if (this.boundingBoxHelper) this.boundingBoxHelper.visible = false;
+      if (this.axesHelper) this.axesHelper.visible = false;
+      this.normalHelpers.forEach(helper => { helper.visible = false; });
+    } else {
+      this.refreshRenderHelpers();
+    }
+  }
+
+  public getCurrentState(): CharacterSessionState {
+    return {
+      classValue: parseInt(this.classSelect.value || '1', 10) || 1,
+      equipment: {
+        helm: this.helmSelect.value,
+        armor: this.armorSelect.value,
+        pants: this.pantsSelect.value,
+        gloves: this.glovesSelect.value,
+        boots: this.bootsSelect.value,
+        leftWeapon: this.leftWeaponSelect.value,
+        rightWeapon: this.rightWeaponSelect.value,
+        wing: this.wingSelect.value,
+      },
+      animationIndex: this.selectedAnimationIndex,
+      autoRotate: this.autoRotateCheckbox.checked,
+      speed: parseFloat(this.speedSlider.value) || this.animationSpeed,
+      scale: parseFloat(this.scaleSlider.value) || this.characterScale,
+      itemLevel: this.itemLevel,
+      itemExcellent: this.itemExcellentCheckbox.checked,
+      itemAncient: this.itemAncientCheckbox.checked,
+      itemExcellentIntensity: this.itemExcellentIntensity,
+      showSkeleton: this.showSkeletonCheckbox.checked,
+      wireframe: this.wireframeCheckbox.checked,
+      showBoundingBox: this.showBoundingBoxCheckbox.checked,
+      showAxes: this.showAxesCheckbox.checked,
+      showNormals: this.showNormalsCheckbox.checked,
+      backgroundColor: this.bgColorInput.value || '#0b1322',
+      brightness: parseFloat(this.brightnessSlider.value) || 2,
+    };
+  }
+
+  public restoreSessionState(state: CharacterSessionState) {
+    this.pendingSessionState = {
+      ...state,
+      equipment: { ...state.equipment },
+    };
+
+    this.classSelect.value = `${state.classValue}`;
+    this.selectedAnimationIndex = state.animationIndex;
+    this.autoRotateCheckbox.checked = state.autoRotate;
+    this.isAutoRotating = state.autoRotate;
+    this.speedSlider.value = `${state.speed}`;
+    this.speedValueEl.textContent = `${state.speed.toFixed(2)}x`;
+    this.setAnimationSpeed(state.speed);
+    this.scaleSlider.value = `${state.scale}`;
+    this.scaleValueEl.textContent = `${state.scale.toFixed(2)}x`;
+    this.setCharacterScale(state.scale);
+    this.itemLevel = state.itemLevel;
+    this.itemLevelSlider.value = `${state.itemLevel}`;
+    this.itemLevelValueEl.textContent = `+${state.itemLevel}`;
+    this.itemExcellentCheckbox.checked = state.itemExcellent;
+    this.itemAncientCheckbox.checked = state.itemAncient;
+    this.itemIsExcellent = state.itemExcellent;
+    this.itemIsAncient = state.itemAncient;
+    this.itemExcellentIntensity = state.itemExcellentIntensity;
+    this.itemExcellentIntensitySlider.value = `${state.itemExcellentIntensity}`;
+    this.itemExcellentIntensityValueEl.textContent = `${state.itemExcellentIntensity.toFixed(2)}x`;
+    this.showSkeletonCheckbox.checked = state.showSkeleton;
+    this.wireframeCheckbox.checked = state.wireframe;
+    this.showBoundingBoxCheckbox.checked = state.showBoundingBox;
+    this.showAxesCheckbox.checked = state.showAxes;
+    this.showNormalsCheckbox.checked = state.showNormals;
+    this.bgColorInput.value = state.backgroundColor;
+    this.setSceneBackground(state.backgroundColor);
+    this.brightnessSlider.value = `${state.brightness}`;
+    this.brightnessLabel.textContent = `Brightness: ${state.brightness.toFixed(2)}×`;
+    this.setBrightness(state.brightness);
+    this.applyPendingSessionState();
+    this.emitStateChanged();
+  }
+
+  public createCurrentPreset(name: string): CharacterPreset | null {
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      if (this.presetStatusEl) {
+        this.presetStatusEl.textContent = 'Enter a preset name.';
+      }
+      return null;
+    }
+
+    return {
+      id: createId('character_preset'),
+      name: trimmedName,
+      pinned: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ...this.getCurrentState(),
+    };
+  }
+
+  public applyCharacterPreset(preset: CharacterPreset) {
+    this.restoreSessionState(preset);
+    this.scheduleRebuild();
   }
 
   private initThree() {
@@ -243,9 +376,10 @@ export class CharacterTestScene {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.14;
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     container.appendChild(this.renderer.domElement);
+    this.timer.connect(document);
 
     const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     const environmentScene = new RoomEnvironment();
@@ -348,9 +482,12 @@ export class CharacterTestScene {
     this.brightnessSlider = document.getElementById('character-brightness-slider') as HTMLInputElement;
     this.brightnessLabel = document.getElementById('character-brightness-label') as HTMLElement;
     this.statusEl = document.getElementById('character-status') as HTMLElement;
+    this.presetNameInput = document.getElementById('character-preset-name') as HTMLInputElement;
+    this.presetStatusEl = document.getElementById('character-preset-status') as HTMLElement;
 
     this.autoRotateCheckbox.addEventListener('change', () => {
       this.isAutoRotating = this.autoRotateCheckbox.checked;
+      this.emitStateChanged();
     });
     this.autoRotateCheckbox.checked = false;
     this.isAutoRotating = this.autoRotateCheckbox.checked;
@@ -361,6 +498,7 @@ export class CharacterTestScene {
       const speed = parseFloat((e.target as HTMLInputElement).value);
       this.speedValueEl.textContent = `${speed.toFixed(2)}x`;
       this.setAnimationSpeed(speed);
+      this.emitStateChanged();
     });
     this.setAnimationSpeed(this.animationSpeed);
 
@@ -370,6 +508,7 @@ export class CharacterTestScene {
       const scale = parseFloat((e.target as HTMLInputElement).value);
       this.scaleValueEl.textContent = `${scale.toFixed(2)}x`;
       this.setCharacterScale(scale);
+      this.emitStateChanged();
     });
 
     this.itemLevelSlider.value = this.itemLevel.toString();
@@ -379,6 +518,7 @@ export class CharacterTestScene {
       this.itemLevel = Math.min(Math.max(level, 0), 15);
       this.itemLevelValueEl.textContent = `+${this.itemLevel}`;
       this.updateItemShaderParams();
+      this.emitStateChanged();
     });
 
     this.itemExcellentCheckbox.checked = false;
@@ -386,10 +526,12 @@ export class CharacterTestScene {
     this.itemExcellentCheckbox.addEventListener('change', () => {
       this.itemIsExcellent = this.itemExcellentCheckbox.checked;
       this.updateItemShaderParams();
+      this.emitStateChanged();
     });
     this.itemAncientCheckbox.addEventListener('change', () => {
       this.itemIsAncient = this.itemAncientCheckbox.checked;
       this.updateItemShaderParams();
+      this.emitStateChanged();
     });
 
     this.itemExcellentIntensitySlider.value = this.itemExcellentIntensity.toString();
@@ -399,33 +541,40 @@ export class CharacterTestScene {
       this.itemExcellentIntensity = Math.min(Math.max(value, 0), 2.5);
       this.itemExcellentIntensityValueEl.textContent = `${this.itemExcellentIntensity.toFixed(2)}x`;
       this.updateItemShaderParams();
+      this.emitStateChanged();
     });
 
     this.exportGifBtn.addEventListener('click', () => this.exportGif());
 
     this.showSkeletonCheckbox.addEventListener('change', () => {
       this.updateSkeletonHelperState();
+      this.emitStateChanged();
     });
 
     this.wireframeCheckbox.addEventListener('change', () => {
       this.applyWireframeState();
+      this.emitStateChanged();
     });
 
     this.showBoundingBoxCheckbox.addEventListener('change', () => {
       this.updateBoundingBoxHelperState();
+      this.emitStateChanged();
     });
 
     this.showAxesCheckbox.addEventListener('change', () => {
       this.updateAxesHelperState();
+      this.emitStateChanged();
     });
 
     this.showNormalsCheckbox.addEventListener('change', () => {
       this.updateNormalsHelpersState();
+      this.emitStateChanged();
     });
 
     this.bgColorInput.addEventListener('input', e => {
       const color = (e.target as HTMLInputElement).value;
       this.setSceneBackground(color);
+      this.emitStateChanged();
     });
     this.setSceneBackground(this.bgColorInput.value || '#0b1322');
 
@@ -433,6 +582,7 @@ export class CharacterTestScene {
       const value = parseFloat((e.target as HTMLInputElement).value);
       this.brightnessLabel.textContent = `Brightness: ${value.toFixed(2)}×`;
       this.setBrightness(value);
+      this.emitStateChanged();
     });
     const initialBrightness = parseFloat(this.brightnessSlider.value) || 2.0;
     this.brightnessLabel.textContent = `Brightness: ${initialBrightness.toFixed(2)}×`;
@@ -465,6 +615,20 @@ export class CharacterTestScene {
     };
 
     setupDropZone(this.dataDropZone, this.dataInput);
+
+    document.getElementById('character-save-preset-btn')?.addEventListener('click', () => {
+      const preset = this.createCurrentPreset(this.presetNameInput?.value || '');
+      if (!preset) {
+        return;
+      }
+      this.onPresetSaveRequested?.(preset);
+      if (this.presetNameInput) {
+        this.presetNameInput.value = '';
+      }
+      if (this.presetStatusEl) {
+        this.presetStatusEl.textContent = `Saved preset "${preset.name}".`;
+      }
+    });
   }
 
   private populateClassSelect() {
@@ -479,7 +643,10 @@ export class CharacterTestScene {
   }
 
   private bindSelectChanges() {
-    const onChange = () => this.scheduleRebuild();
+    const onChange = () => {
+      this.scheduleRebuild();
+      this.emitStateChanged();
+    };
     this.classSelect.addEventListener('change', onChange);
     this.helmSelect.addEventListener('change', onChange);
     this.armorSelect.addEventListener('change', onChange);
@@ -494,6 +661,7 @@ export class CharacterTestScene {
       const idx = parseInt(this.animationSelect.value, 10);
       if (Number.isNaN(idx) || !this.characterRoot?.animations?.length) return;
       this.playAnimation(idx);
+      this.emitStateChanged();
     });
   }
 
@@ -529,6 +697,7 @@ export class CharacterTestScene {
       if (ok) {
         this.dataStatus.textContent = `Loaded Data folder: ${source}`;
         this.statusEl.textContent = 'Item database loaded.';
+        this.applyPendingSessionState();
         this.scheduleRebuild();
       } else {
         this.dataStatus.textContent = 'Failed to load item.bmd from Data folder.';
@@ -565,6 +734,7 @@ export class CharacterTestScene {
     if (ok) {
       this.dataStatus.textContent = `Loaded Data folder (${files.length} files)`;
       this.statusEl.textContent = 'Item database loaded.';
+      this.applyPendingSessionState();
       this.scheduleRebuild();
     } else {
       this.dataStatus.textContent = 'Failed to load item.bmd from Data folder.';
@@ -585,6 +755,7 @@ export class CharacterTestScene {
     });
 
     this.populateItemSelects();
+    this.emitStateChanged();
     return true;
   }
 
@@ -643,6 +814,27 @@ export class CharacterTestScene {
     select.value = '';
   }
 
+  private applyPendingSessionState() {
+    if (!this.pendingSessionState) {
+      return;
+    }
+
+    const state = this.pendingSessionState;
+    this.helmSelect.value = state.equipment.helm;
+    this.armorSelect.value = state.equipment.armor;
+    this.pantsSelect.value = state.equipment.pants;
+    this.glovesSelect.value = state.equipment.gloves;
+    this.bootsSelect.value = state.equipment.boots;
+    this.leftWeaponSelect.value = state.equipment.leftWeapon;
+    this.rightWeaponSelect.value = state.equipment.rightWeapon;
+    this.wingSelect.value = state.equipment.wing;
+    this.pendingSessionState = null;
+  }
+
+  private emitStateChanged() {
+    this.onStateChanged?.(this.getCurrentState());
+  }
+
   private scheduleRebuild() {
     if (!this.itemDefinitions.length) return;
     this.rebuildCharacter();
@@ -691,6 +883,7 @@ export class CharacterTestScene {
       this.statusEl.textContent = 'No skeleton found in base model.';
       return;
     }
+    this.baseBmdBones = this.getBmdBones(this.characterRoot);
     this.baseBindMatrix = this.findBaseBindMatrix(this.characterRoot);
 
     await this.applyTexturesForGroup(baseGroup.group);
@@ -776,6 +969,7 @@ export class CharacterTestScene {
         this.applySceneMaterialTuning(part.group);
         this.attachToBone(part.group, entry.bone ?? 0);
         await this.applyTexturesForGroup(part.group);
+        this.startItemAnimation(part.group);
       }
     }
 
@@ -797,6 +991,7 @@ export class CharacterTestScene {
     this.refreshRenderHelpers();
     this.updateStageForObject(this.characterRoot);
     this.statusEl.textContent = 'Character ready.';
+    this.emitStateChanged();
   }
 
   private resolveArmorPath(path: string): string[] {
@@ -946,7 +1141,7 @@ export class CharacterTestScene {
 
   private attachToBone(group: THREE.Group, boneIndex: number) {
     if (!this.baseSkeleton) return;
-    const bone = this.baseSkeleton.bones[boneIndex];
+    const bone = resolveAttachmentBoneByBmdIndex(this.baseSkeleton.bones, this.baseBmdBones, boneIndex);
     if (!bone) {
       console.warn(`[CharacterTestScene] Missing bone ${boneIndex}`);
       return;
@@ -957,6 +1152,13 @@ export class CharacterTestScene {
     group.scale.set(1, 1, 1);
 
     bone.add(group);
+  }
+
+  private startItemAnimation(group: THREE.Group) {
+    const playback = startCharacterItemAnimation(group, group.animations, this.animationSpeed);
+    if (playback) {
+      this.itemAnimationPlaybacks.push(playback);
+    }
   }
 
   private async applyTexturesForGroup(group: THREE.Group) {
@@ -1001,6 +1203,11 @@ export class CharacterTestScene {
         applyBlendModeToMaterial(mat, blendResult);
       }
     });
+  }
+
+  private getBmdBones(group: THREE.Group): THREE.Bone[] | null {
+    const bones = group.userData.bmdBones;
+    return Array.isArray(bones) ? bones as THREE.Bone[] : null;
   }
 
   private applyItemShader(mesh: THREE.Mesh, texture: THREE.Texture, blendResult: BlendHeuristicResult) {
@@ -1445,6 +1652,7 @@ export class CharacterTestScene {
     if (this.currentAction) {
       this.currentAction.setEffectiveTimeScale(speed);
     }
+    updateCharacterItemAnimationSpeed(this.itemAnimationPlaybacks, speed);
   }
 
   private setCharacterScale(scale: number) {
@@ -1961,11 +2169,13 @@ export class CharacterTestScene {
 
     this.characterRoot = null;
     this.baseSkeleton = null;
+    this.baseBmdBones = null;
     this.baseBindMatrix = null;
 
     // Properly dispose mixer before setting to null
     this.mixer = Disposer.disposeMixer(this.mixer);
     this.currentAction = null;
+    disposeCharacterItemAnimations(this.itemAnimationPlaybacks);
 
     if (this.skeletonHelper) {
       this.scene.remove(this.skeletonHelper);
@@ -2041,7 +2251,8 @@ export class CharacterTestScene {
     }
 
     try {
-      const clips = this.bmdLoader.loadAnimationsFrom(file.buffer, this.baseSkeleton);
+      const bmdBones = this.characterRoot?.userData.bmdBones as THREE.Bone[] | undefined;
+      const clips = this.bmdLoader.loadAnimationsFrom(file.buffer, this.baseSkeleton, bmdBones);
       this.playerAnimations = clips;
       return clips;
     } catch (error) {
@@ -2050,9 +2261,10 @@ export class CharacterTestScene {
     }
   }
 
-  private animate = () => {
+  private animate = (timestamp?: DOMHighResTimeStamp) => {
     requestAnimationFrame(this.animate);
-    const delta = this.clock.getDelta();
+    this.timer.update(timestamp);
+    const delta = this.timer.getDelta();
     if (!this.isActive) return;
 
     const now = performance.now();
@@ -2066,6 +2278,9 @@ export class CharacterTestScene {
 
     if (this.mixer && !this.isRecordingGif) {
       this.mixer.update(delta);
+    }
+    if (this.itemAnimationPlaybacks.length && !this.isRecordingGif) {
+      this.itemAnimationPlaybacks.forEach(playback => playback.mixer.update(delta));
     }
 
     if (this.itemShaderMaterials.size) {

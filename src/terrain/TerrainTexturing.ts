@@ -16,6 +16,9 @@ export interface TerrainAtlas {
     tileUvScale: number;
 }
 
+export type TerrainMaterialMode = 'shader' | 'baked';
+const TERRAIN_BAKED_TEXTURE_SIZE = 4096;
+
 /**
  * Build a texture atlas where every texture is TILED to fill its entire cell.
  *
@@ -271,7 +274,12 @@ export function createTerrainMaterial(
     atlas: TerrainAtlas,
     mapping: TerrainMappingData,
     useLightmap: boolean,
-): THREE.ShaderMaterial {
+    mode: TerrainMaterialMode = 'shader',
+): THREE.Material {
+    if (mode === 'baked') {
+        return createTerrainBakedMaterial(atlas, mapping, useLightmap);
+    }
+
     const { layer1Tex, layer2Tex, alphaTex } = createMappingTextures(mapping);
     const inset = 0.5 / atlas.cellSize;
 
@@ -294,6 +302,173 @@ export function createTerrainMaterial(
             uDebugMode: { value: 0 },
         },
         vertexColors: true,
+        side: THREE.FrontSide,
+    });
+}
+
+function clampIndex(value: number): number {
+    return Math.min(TERRAIN_SIZE - 1, Math.max(0, value));
+}
+
+function sampleMapIndex(data: Uint8Array, x: number, y: number): number {
+    return data[clampIndex(y) * TERRAIN_SIZE + clampIndex(x)];
+}
+
+function sampleAtlasBilinear(
+    atlasPixels: Uint8ClampedArray,
+    atlasWidth: number,
+    atlasHeight: number,
+    atlas: TerrainAtlas,
+    tileIndex: number,
+    tileUvX: number,
+    tileUvY: number,
+): [number, number, number] {
+    if (tileIndex < 0 || tileIndex >= atlas.count) {
+        return [255, 0, 255];
+    }
+
+    const col = tileIndex % atlas.cols;
+    const row = Math.floor(tileIndex / atlas.cols);
+    const inset = 0.5 / atlas.cellSize;
+    const localUvX = Math.min(1 - inset, Math.max(inset, tileUvX - Math.floor(tileUvX)));
+    const localUvY = Math.min(1 - inset, Math.max(inset, tileUvY - Math.floor(tileUvY)));
+    const atlasU = (col + localUvX) / atlas.cols;
+    const atlasV = (row + localUvY) / atlas.rows;
+
+    // Bilinear: compute fractional pixel coordinates and sample 4 neighbors
+    const px = atlasU * atlasWidth - 0.5;
+    const py = atlasV * atlasHeight - 0.5;
+    const x0 = Math.max(0, Math.min(atlasWidth - 1, Math.floor(px)));
+    const y0 = Math.max(0, Math.min(atlasHeight - 1, Math.floor(py)));
+    const x1 = Math.min(atlasWidth - 1, x0 + 1);
+    const y1 = Math.min(atlasHeight - 1, y0 + 1);
+    const fx = px - Math.floor(px);
+    const fy = py - Math.floor(py);
+
+    const o00 = (y0 * atlasWidth + x0) * 4;
+    const o10 = (y0 * atlasWidth + x1) * 4;
+    const o01 = (y1 * atlasWidth + x0) * 4;
+    const o11 = (y1 * atlasWidth + x1) * 4;
+
+    const r = (atlasPixels[o00] * (1 - fx) * (1 - fy) + atlasPixels[o10] * fx * (1 - fy) +
+               atlasPixels[o01] * (1 - fx) * fy + atlasPixels[o11] * fx * fy);
+    const g = (atlasPixels[o00 + 1] * (1 - fx) * (1 - fy) + atlasPixels[o10 + 1] * fx * (1 - fy) +
+               atlasPixels[o01 + 1] * (1 - fx) * fy + atlasPixels[o11 + 1] * fx * fy);
+    const b = (atlasPixels[o00 + 2] * (1 - fx) * (1 - fy) + atlasPixels[o10 + 2] * fx * (1 - fy) +
+               atlasPixels[o01 + 2] * (1 - fx) * fy + atlasPixels[o11 + 2] * fx * fy);
+
+    return [Math.round(r), Math.round(g), Math.round(b)];
+}
+
+function createTerrainBakedMaterial(
+    atlas: TerrainAtlas,
+    mapping: TerrainMappingData,
+    useLightmap: boolean,
+): THREE.Material {
+    const atlasCanvas = atlas.texture.image as HTMLCanvasElement | OffscreenCanvas | undefined;
+    if (!atlasCanvas || !('getContext' in atlasCanvas)) {
+        return new THREE.MeshLambertMaterial({
+            color: 0x7c8b5b,
+            vertexColors: useLightmap,
+            side: THREE.FrontSide,
+        });
+    }
+
+    const atlasContext = atlasCanvas.getContext('2d', { willReadFrequently: true });
+    if (!atlasContext) {
+        return new THREE.MeshLambertMaterial({
+            color: 0x7c8b5b,
+            vertexColors: useLightmap,
+            side: THREE.FrontSide,
+        });
+    }
+
+    const atlasWidth = (atlasCanvas as HTMLCanvasElement).width;
+    const atlasHeight = (atlasCanvas as HTMLCanvasElement).height;
+    const atlasPixels = atlasContext.getImageData(0, 0, atlasWidth, atlasHeight).data;
+
+    const bakedCanvas = document.createElement('canvas');
+    bakedCanvas.width = TERRAIN_BAKED_TEXTURE_SIZE;
+    bakedCanvas.height = TERRAIN_BAKED_TEXTURE_SIZE;
+    const bakedContext = bakedCanvas.getContext('2d');
+    if (!bakedContext) {
+        return new THREE.MeshLambertMaterial({
+            color: 0x7c8b5b,
+            vertexColors: useLightmap,
+            side: THREE.FrontSide,
+        });
+    }
+
+    const bakedImage = bakedContext.createImageData(TERRAIN_BAKED_TEXTURE_SIZE, TERRAIN_BAKED_TEXTURE_SIZE);
+    const bakedPixels = bakedImage.data;
+    const tileUvScale = atlas.tileUvScale;
+
+    for (let y = 0; y < TERRAIN_BAKED_TEXTURE_SIZE; y++) {
+        const worldTileY = ((y + 0.5) / TERRAIN_BAKED_TEXTURE_SIZE) * TERRAIN_SIZE;
+        const tileY = clampIndex(Math.floor(worldTileY + 0.0002));
+        const fracY = worldTileY - tileY;
+        const tileY1 = clampIndex(tileY + 1);
+
+        for (let x = 0; x < TERRAIN_BAKED_TEXTURE_SIZE; x++) {
+            const worldTileX = ((x + 0.5) / TERRAIN_BAKED_TEXTURE_SIZE) * TERRAIN_SIZE;
+            const tileX = clampIndex(Math.floor(worldTileX + 0.0002));
+            const fracX = worldTileX - tileX;
+            const tileX1 = clampIndex(tileX + 1);
+
+            const idx1 = sampleMapIndex(mapping.layer1, tileX, tileY);
+            const idx2 = sampleMapIndex(mapping.layer2, tileX, tileY);
+
+            const a1 = sampleMapIndex(mapping.alpha, tileX, tileY) / 255;
+            const a2 = sampleMapIndex(mapping.alpha, tileX1, tileY) / 255;
+            const a3 = sampleMapIndex(mapping.alpha, tileX1, tileY1) / 255;
+            const a4 = sampleMapIndex(mapping.alpha, tileX, tileY1) / 255;
+            const blendAlpha = THREE.MathUtils.lerp(
+                THREE.MathUtils.lerp(a1, a2, fracX),
+                THREE.MathUtils.lerp(a4, a3, fracX),
+                fracY,
+            );
+
+            const tileUvX = worldTileX * tileUvScale;
+            const tileUvY = worldTileY * tileUvScale;
+            const base = sampleAtlasBilinear(atlasPixels, atlasWidth, atlasHeight, atlas, idx1, tileUvX, tileUvY);
+            let r = base[0];
+            let g = base[1];
+            let b = base[2];
+
+            const layer2Valid = idx2 < 255 && idx2 < atlas.count;
+            const isOpaque = a1 >= (254.5 / 255) && a2 >= (254.5 / 255) && a3 >= (254.5 / 255) && a4 >= (254.5 / 255);
+            if (isOpaque && layer2Valid) {
+                [r, g, b] = sampleAtlasBilinear(atlasPixels, atlasWidth, atlasHeight, atlas, idx2, tileUvX, tileUvY);
+            } else if (blendAlpha > 0 && layer2Valid) {
+                const overlay = sampleAtlasBilinear(atlasPixels, atlasWidth, atlasHeight, atlas, idx2, tileUvX, tileUvY);
+                r = Math.round(THREE.MathUtils.lerp(r, overlay[0], blendAlpha));
+                g = Math.round(THREE.MathUtils.lerp(g, overlay[1], blendAlpha));
+                b = Math.round(THREE.MathUtils.lerp(b, overlay[2], blendAlpha));
+            }
+
+            const offset = (y * TERRAIN_BAKED_TEXTURE_SIZE + x) * 4;
+            bakedPixels[offset] = r;
+            bakedPixels[offset + 1] = g;
+            bakedPixels[offset + 2] = b;
+            bakedPixels[offset + 3] = 255;
+        }
+    }
+
+    bakedContext.putImageData(bakedImage, 0, 0);
+
+    const bakedTexture = new THREE.CanvasTexture(bakedCanvas);
+    bakedTexture.colorSpace = THREE.NoColorSpace;
+    bakedTexture.wrapS = THREE.ClampToEdgeWrapping;
+    bakedTexture.wrapT = THREE.ClampToEdgeWrapping;
+    bakedTexture.magFilter = THREE.LinearFilter;
+    bakedTexture.minFilter = THREE.LinearMipmapLinearFilter;
+    bakedTexture.generateMipmaps = true;
+    bakedTexture.flipY = false;
+    bakedTexture.needsUpdate = true;
+
+    return new THREE.MeshLambertMaterial({
+        map: bakedTexture,
+        vertexColors: useLightmap,
         side: THREE.FrontSide,
     });
 }
