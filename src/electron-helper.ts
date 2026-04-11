@@ -7,6 +7,17 @@ export interface TerrainWorldFileData {
   data: ArrayBuffer;
 }
 
+export interface TerrainObjectOverridesFileData {
+  path: string | null;
+  data: unknown;
+  error?: string;
+}
+
+export interface TerrainObjectOverridesWriteResult {
+  path: string | null;
+  error?: string;
+}
+
 // Type definitions for Electron API
 interface ElectronAPI {
   isElectron: boolean;
@@ -17,6 +28,8 @@ interface ElectronAPI {
   scanWorldFolders: (dataRootPath: string) => Promise<number[]>;
   readTerrainWorldFiles: (dataRootPath: string, worldNumber: number) => Promise<TerrainWorldFileData[]>;
   searchTextures: (startPath: string, requiredTextures: string[]) => Promise<Record<string, string[]>>;
+  readTerrainObjectOverrides: () => Promise<TerrainObjectOverridesFileData>;
+  writeTerrainObjectOverrides: (data: unknown) => Promise<TerrainObjectOverridesWriteResult>;
   getFilePath: (file: File) => string | null;
 }
 
@@ -126,6 +139,30 @@ export async function searchTextures(
     return {};
   }
   return window.electronAPI.searchTextures(startPath, requiredTextures);
+}
+
+/**
+ * Read terrain object override settings from the app data folder.
+ */
+export async function readTerrainObjectOverrides(): Promise<TerrainObjectOverridesFileData> {
+  if (!isElectron() || !window.electronAPI) {
+    return {
+      path: null,
+      data: localStorage.getItem('terrain-object-overrides'),
+    };
+  }
+  return window.electronAPI.readTerrainObjectOverrides();
+}
+
+/**
+ * Write terrain object override settings to the app data folder.
+ */
+export async function writeTerrainObjectOverrides(data: unknown): Promise<TerrainObjectOverridesWriteResult> {
+  if (!isElectron() || !window.electronAPI) {
+    localStorage.setItem('terrain-object-overrides', JSON.stringify(data, null, 2));
+    return { path: 'localStorage:terrain-object-overrides' };
+  }
+  return window.electronAPI.writeTerrainObjectOverrides(data);
 }
 
 /**

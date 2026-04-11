@@ -671,6 +671,43 @@
 
       <div id="terrain-canvas-container"></div>
 
+      <aside id="terrain-object-editor-panel" class="terrain-object-editor-panel hidden">
+        <div class="terrain-editor-header">
+          <div>
+            <p class="sidebar-eyebrow">World Object</p>
+            <h2 class="terrain-editor-title" id="terrain-editor-title">Object Editor</h2>
+          </div>
+          <button id="terrain-editor-close-btn" class="folder-browser-close" title="Close panel">✕</button>
+        </div>
+
+        <p id="terrain-editor-meta" class="control-note accent-note">Right-click a selected object.</p>
+
+        <div class="section-divider">
+          <h3>Transform</h3>
+          <label class="field-label" for="terrain-editor-pos-x">Position</label>
+          <div class="row-inline">
+            <input id="terrain-editor-pos-x" type="number" class="frame-input input-w-md" step="1" placeholder="X">
+            <input id="terrain-editor-pos-y" type="number" class="frame-input input-w-md" step="1" placeholder="Y">
+            <input id="terrain-editor-pos-z" type="number" class="frame-input input-w-md" step="1" placeholder="Z">
+          </div>
+          <label class="field-label space-top-sm" for="terrain-editor-scale">Scale</label>
+          <input id="terrain-editor-scale" type="number" class="frame-input full-width" min="0.01" step="0.01">
+          <button id="terrain-editor-apply-transform-btn" class="modern-btn btn-primary full-width space-top-sm">Apply Transform</button>
+        </div>
+
+        <div class="section-divider">
+          <h3>Type Materials</h3>
+          <p class="control-note">Save applies blending and alpha threshold to every object with this World and Type.</p>
+          <div id="terrain-editor-materials" class="stack-md space-top-sm"></div>
+        </div>
+
+        <div class="section-divider stack-sm">
+          <button id="terrain-editor-save-btn" class="modern-btn btn-primary full-width">Save Object Settings</button>
+          <button id="terrain-editor-reset-btn" class="modern-btn btn-danger full-width">Reset Object Settings</button>
+          <p id="terrain-editor-status" class="control-note"></p>
+        </div>
+      </aside>
+
       <div id="terrain-status-bar">Ready</div>
     </main>
 

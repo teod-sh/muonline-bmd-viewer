@@ -23,9 +23,23 @@ import {
     createFileFromElectronData,
     isElectron,
     openDirectoryDialog,
+    readTerrainObjectOverrides,
     readTerrainWorldFiles,
     scanWorldFolders,
+    writeTerrainObjectOverrides,
 } from './electron-helper';
+import {
+    createEmptyTerrainObjectOverrides,
+    normalizeTerrainObjectOverrides,
+    removeTerrainObjectTransformOverride,
+    removeTerrainObjectTypeOverride,
+    TERRAIN_OBJECT_BLEND_MODE_NAMES,
+    type TerrainObjectBlendModeName,
+    type TerrainObjectMaterialOverride,
+    type TerrainObjectOverridesFile,
+    upsertTerrainObjectTransformOverride,
+    upsertTerrainObjectTypeOverride,
+} from './terrain/TerrainObjectOverrides';
 
 const TERRAIN_BASE_AMBIENT_INTENSITY = 0.6;
 const TERRAIN_BASE_SUN_INTENSITY = 1.0;
@@ -40,6 +54,25 @@ const TERRAIN_MAX_DELTA_SECONDS = 0.1;
 type SupportedRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
 type TerrainRendererBackendPreference = TerrainSessionState['rendererBackend'];
 type TerrainRendererBackendActive = 'webgpu' | 'webgl';
+type TerrainMaterialBinding = {
+    key: string;
+    label: string;
+    materials: THREE.Material[];
+};
+
+const TERRAIN_OBJECT_BLEND_MODE_TO_THREE: Record<TerrainObjectBlendModeName, THREE.Blending> = {
+    Opaque: THREE.NoBlending,
+    Normal: THREE.NormalBlending,
+    Additive: THREE.AdditiveBlending,
+    Multiply: THREE.MultiplyBlending,
+    Subtractive: THREE.SubtractiveBlending,
+};
+const TERRAIN_THREE_BLEND_TO_OBJECT_MODE = new Map<THREE.Blending, TerrainObjectBlendModeName>(
+    Object.entries(TERRAIN_OBJECT_BLEND_MODE_TO_THREE).map(([name, value]) => [
+        value,
+        name as TerrainObjectBlendModeName,
+    ]),
+);
 
 type MovementKeyCode = 'KeyW' | 'KeyA' | 'KeyS' | 'KeyD' | 'ShiftLeft' | 'ShiftRight';
 const MOVEMENT_KEYS: readonly MovementKeyCode[] = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'ShiftRight'];
@@ -141,13 +174,29 @@ export class TerrainScene {
     private objectScaleEl: HTMLElement | null = null;
     private openModelBtn: HTMLButtonElement | null = null;
     private openModelHintEl: HTMLElement | null = null;
+    private objectEditorPanelEl: HTMLElement | null = null;
+    private objectEditorTitleEl: HTMLElement | null = null;
+    private objectEditorMetaEl: HTMLElement | null = null;
+    private objectEditorCloseBtn: HTMLButtonElement | null = null;
+    private objectEditorPosXEl: HTMLInputElement | null = null;
+    private objectEditorPosYEl: HTMLInputElement | null = null;
+    private objectEditorPosZEl: HTMLInputElement | null = null;
+    private objectEditorScaleEl: HTMLInputElement | null = null;
+    private objectEditorApplyTransformBtn: HTMLButtonElement | null = null;
+    private objectEditorMaterialsEl: HTMLElement | null = null;
+    private objectEditorSaveBtn: HTMLButtonElement | null = null;
+    private objectEditorResetBtn: HTMLButtonElement | null = null;
+    private objectEditorStatusEl: HTMLElement | null = null;
     private lastContextEl: HTMLElement | null = null;
     private tileCountEl: HTMLElement | null = null;
     private objectCountEl: HTMLElement | null = null;
+    private objectOverrides: TerrainObjectOverridesFile = createEmptyTerrainObjectOverrides();
+    private objectOverridesPath: string | null = null;
 
     constructor() {
         this.initThree();
         this.initUI();
+        void this.loadObjectOverrides();
         this.animate();
     }
 
@@ -372,6 +421,10 @@ export class TerrainScene {
                 return;
             }
             this.handleCanvasSelection(event);
+        });
+        domElement.addEventListener('contextmenu', event => {
+            event.preventDefault();
+            this.handleCanvasObjectEditRequest(event);
         });
     }
 
@@ -613,6 +666,19 @@ export class TerrainScene {
         this.objectScaleEl = document.getElementById('terrain-selected-scale');
         this.openModelBtn = document.getElementById('terrain-open-model-btn') as HTMLButtonElement | null;
         this.openModelHintEl = document.getElementById('terrain-open-model-hint');
+        this.objectEditorPanelEl = document.getElementById('terrain-object-editor-panel');
+        this.objectEditorTitleEl = document.getElementById('terrain-editor-title');
+        this.objectEditorMetaEl = document.getElementById('terrain-editor-meta');
+        this.objectEditorCloseBtn = document.getElementById('terrain-editor-close-btn') as HTMLButtonElement | null;
+        this.objectEditorPosXEl = document.getElementById('terrain-editor-pos-x') as HTMLInputElement | null;
+        this.objectEditorPosYEl = document.getElementById('terrain-editor-pos-y') as HTMLInputElement | null;
+        this.objectEditorPosZEl = document.getElementById('terrain-editor-pos-z') as HTMLInputElement | null;
+        this.objectEditorScaleEl = document.getElementById('terrain-editor-scale') as HTMLInputElement | null;
+        this.objectEditorApplyTransformBtn = document.getElementById('terrain-editor-apply-transform-btn') as HTMLButtonElement | null;
+        this.objectEditorMaterialsEl = document.getElementById('terrain-editor-materials');
+        this.objectEditorSaveBtn = document.getElementById('terrain-editor-save-btn') as HTMLButtonElement | null;
+        this.objectEditorResetBtn = document.getElementById('terrain-editor-reset-btn') as HTMLButtonElement | null;
+        this.objectEditorStatusEl = document.getElementById('terrain-editor-status');
         this.lastContextEl = document.getElementById('terrain-last-context');
         this.tileCountEl = document.getElementById('terrain-tile-count');
         this.objectCountEl = document.getElementById('terrain-object-count');
@@ -774,6 +840,10 @@ export class TerrainScene {
             if (!this.selectedObjectRecord) return;
             this.onOpenModelRequest?.(this.selectedObjectRecord.selection, this.selectedObjectRecord.modelFile);
         });
+        this.objectEditorCloseBtn?.addEventListener('click', () => this.closeObjectEditorPanel());
+        this.objectEditorApplyTransformBtn?.addEventListener('click', () => this.applyObjectEditorTransform());
+        this.objectEditorSaveBtn?.addEventListener('click', () => { void this.saveSelectedObjectTypeSettings(); });
+        this.objectEditorResetBtn?.addEventListener('click', () => { void this.resetSelectedObjectTypeSettings(); });
 
         window.addEventListener('keydown', (e) => this.handleMovementKey(e, true));
         window.addEventListener('keyup', (e) => this.handleMovementKey(e, false));
@@ -972,6 +1042,7 @@ export class TerrainScene {
                 this.objectRecords = objectResult.records;
                 this.animatedObjectInstances = objectResult.animatedInstances;
                 this.scene.add(this.objectsGroup);
+                this.applyPersistedObjectTypeOverridesForWorld(result.mapNumber);
 
                 if (this.showObjectsEl && this.objectsGroup) {
                     this.objectsGroup.visible = this.showObjectsEl.checked;
@@ -1074,17 +1145,41 @@ export class TerrainScene {
             return;
         }
 
-        const rect = this.renderer.domElement.getBoundingClientRect();
-        this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-        this.raycaster.setFromCamera(this.pointer, this.camera);
-        const intersections = this.raycaster.intersectObject(this.objectsGroup, true);
-        const record = this.resolveSelectionRecord(intersections);
+        const record = this.pickObjectRecordAtClientPoint(event.clientX, event.clientY);
         if (record) {
             this.selectObjectRecord(record);
         } else {
             this.clearSelection();
         }
+    }
+
+    private handleCanvasObjectEditRequest(event: MouseEvent) {
+        if (!this.objectsGroup) {
+            return;
+        }
+
+        const record = this.pickObjectRecordAtClientPoint(event.clientX, event.clientY);
+        if (!record) {
+            return;
+        }
+
+        if (this.selectedObjectRecord?.selection.objectId !== record.selection.objectId) {
+            this.selectObjectRecord(record);
+        }
+        this.openObjectEditorPanel();
+    }
+
+    private pickObjectRecordAtClientPoint(clientX: number, clientY: number): TerrainObjectSelectionRecord | null {
+        if (!this.objectsGroup) {
+            return null;
+        }
+
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+        this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+        this.raycaster.setFromCamera(this.pointer, this.camera);
+        const intersections = this.raycaster.intersectObject(this.objectsGroup, true);
+        return this.resolveSelectionRecord(intersections);
     }
 
     private resolveSelectionRecord(intersections: THREE.Intersection<THREE.Object3D<THREE.Object3DEventMap>>[]): TerrainObjectSelectionRecord | null {
@@ -1107,6 +1202,9 @@ export class TerrainScene {
         this.selectedObjectRecord = record;
         this.updateObjectInspector();
         this.updateSelectionMarker();
+        if (this.objectEditorPanelEl && !this.objectEditorPanelEl.classList.contains('hidden')) {
+            this.populateObjectEditorPanel();
+        }
         this.onObjectSelected?.(record.selection);
         this.minimapNeedsRedraw = true;
     }
@@ -1115,6 +1213,7 @@ export class TerrainScene {
         this.selectedObjectRecord = null;
         this.updateObjectInspector();
         this.updateSelectionMarker();
+        this.closeObjectEditorPanel();
         this.onObjectSelected?.(null);
         this.minimapNeedsRedraw = true;
     }
@@ -1146,6 +1245,602 @@ export class TerrainScene {
             this.openModelHintEl.textContent = record.modelFile
                 ? 'Model file resolved from current world data.'
                 : 'Model file is not available in the currently loaded world files.';
+        }
+    }
+
+    private async loadObjectOverrides() {
+        try {
+            const result = await readTerrainObjectOverrides();
+            this.objectOverridesPath = result.path;
+            let rawData = result.data;
+            if (typeof rawData === 'string') {
+                try {
+                    rawData = JSON.parse(rawData);
+                } catch {
+                    rawData = null;
+                }
+            }
+            this.objectOverrides = normalizeTerrainObjectOverrides(rawData);
+            if (this.loadedWorldNumber !== null) {
+                this.applyPersistedObjectTypeOverridesForWorld(this.loadedWorldNumber);
+            }
+        } catch (error) {
+            console.warn('Failed to load terrain object overrides:', error);
+            this.objectOverrides = createEmptyTerrainObjectOverrides();
+        }
+    }
+
+    private async writeObjectOverrides(statusPrefix: string) {
+        const result = await writeTerrainObjectOverrides(this.objectOverrides);
+        this.objectOverridesPath = result.path;
+        if (result.error) {
+            this.setObjectEditorStatus(`${statusPrefix} failed: ${result.error}`);
+            return;
+        }
+
+        this.setObjectEditorStatus(this.objectOverridesPath
+            ? `${statusPrefix}: ${this.objectOverridesPath}`
+            : statusPrefix);
+    }
+
+    private openObjectEditorPanel() {
+        if (!this.selectedObjectRecord || !this.objectEditorPanelEl) {
+            return;
+        }
+
+        this.populateObjectEditorPanel();
+        this.objectEditorPanelEl.classList.remove('hidden');
+    }
+
+    private closeObjectEditorPanel() {
+        this.objectEditorPanelEl?.classList.add('hidden');
+    }
+
+    private populateObjectEditorPanel() {
+        const record = this.selectedObjectRecord;
+        if (!record) return;
+
+        const selection = record.selection;
+        if (this.objectEditorTitleEl) {
+            this.objectEditorTitleEl.textContent = selection.displayName;
+        }
+        if (this.objectEditorMetaEl) {
+            this.objectEditorMetaEl.textContent = `World ${selection.worldNumber} / Type ${selection.type}`;
+        }
+        if (this.objectEditorPosXEl) this.objectEditorPosXEl.value = selection.position.x.toFixed(0);
+        if (this.objectEditorPosYEl) this.objectEditorPosYEl.value = selection.position.y.toFixed(0);
+        if (this.objectEditorPosZEl) this.objectEditorPosZEl.value = selection.position.z.toFixed(0);
+        if (this.objectEditorScaleEl) this.objectEditorScaleEl.value = selection.scale.toFixed(2);
+
+        this.renderObjectEditorMaterialRows(selection.worldNumber, selection.type);
+        this.setObjectEditorStatus(this.objectOverridesPath
+            ? `Settings file: ${this.objectOverridesPath}`
+            : 'Settings file will be created on save.');
+    }
+
+    private renderObjectEditorMaterialRows(worldNumber: number, objectType: number) {
+        if (!this.objectEditorMaterialsEl) return;
+
+        this.objectEditorMaterialsEl.innerHTML = '';
+        const bindings = this.collectMaterialBindingsForType(worldNumber, objectType);
+        if (bindings.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'control-note';
+            empty.textContent = 'No editable mesh materials found.';
+            this.objectEditorMaterialsEl.appendChild(empty);
+            return;
+        }
+
+        for (const binding of bindings) {
+            const current = this.getMaterialOverrideFromMaterial(binding.materials[0]);
+            const row = document.createElement('div');
+            row.className = 'terrain-editor-material-row';
+            row.dataset.materialKey = binding.key;
+
+            const label = document.createElement('span');
+            label.className = 'blend-label';
+            label.textContent = binding.label;
+
+            const select = document.createElement('select');
+            select.className = 'animation-dropdown blend-select full-width';
+            for (const name of TERRAIN_OBJECT_BLEND_MODE_NAMES) {
+                const option = document.createElement('option');
+                option.value = name;
+                option.text = name;
+                select.appendChild(option);
+            }
+            select.value = current.blending;
+
+            const alphaRow = document.createElement('div');
+            alphaRow.className = 'terrain-alpha-row';
+
+            const alphaLabel = document.createElement('span');
+            alphaLabel.textContent = 'Black Key';
+
+            const alphaSlider = document.createElement('input');
+            alphaSlider.type = 'range';
+            alphaSlider.min = '0';
+            alphaSlider.max = '0.5';
+            alphaSlider.step = '0.01';
+            alphaSlider.className = 'modern-slider';
+            alphaSlider.value = current.alphaTest.toFixed(2);
+
+            const alphaValue = document.createElement('span');
+            alphaValue.className = 'blend-threshold-value';
+            alphaValue.textContent = alphaSlider.value;
+
+            const applyCurrentRow = () => {
+                const alphaTest = Math.max(0, Math.min(0.5, parseFloat(alphaSlider.value) || 0));
+                alphaValue.textContent = alphaTest.toFixed(2);
+                this.applyMaterialOverrideToType(worldNumber, objectType, binding.key, {
+                    blending: select.value as TerrainObjectBlendModeName,
+                    alphaTest,
+                });
+            };
+
+            select.addEventListener('change', applyCurrentRow);
+            alphaSlider.addEventListener('input', applyCurrentRow);
+
+            alphaRow.append(alphaLabel, alphaSlider, alphaValue);
+            row.append(label, select, alphaRow);
+            this.objectEditorMaterialsEl.appendChild(row);
+        }
+    }
+
+    private applyObjectEditorTransform() {
+        const record = this.selectedObjectRecord;
+        if (!record) return;
+
+        const nextPosition = {
+            x: parseFloat(this.objectEditorPosXEl?.value || `${record.selection.position.x}`),
+            y: parseFloat(this.objectEditorPosYEl?.value || `${record.selection.position.y}`),
+            z: parseFloat(this.objectEditorPosZEl?.value || `${record.selection.position.z}`),
+        };
+        const nextScale = Math.max(0.01, parseFloat(this.objectEditorScaleEl?.value || `${record.selection.scale}`) || record.selection.scale);
+        const objectId = record.selection.objectId;
+
+        const matchingRecords = this.objectRecords.filter(candidate => candidate.selection.objectId === objectId);
+        this.applyTransformToObjectRecords(matchingRecords, nextPosition, nextScale);
+
+        this.updateObjectInspector();
+        this.updateSelectionMarker();
+        this.minimapNeedsRedraw = true;
+        this.emitStateChanged();
+        this.setObjectEditorStatus('Transform applied to selected object.');
+    }
+
+    private applyTransformToObjectRecords(
+        matchingRecords: TerrainObjectSelectionRecord[],
+        nextPosition: ExplorerVector3,
+        nextScale: number,
+    ) {
+        if (matchingRecords.length === 0) return;
+
+        const oldPosition = { ...matchingRecords[0].selection.position };
+        const oldScale = Math.max(0.01, matchingRecords[0].selection.scale);
+        const scaleRatio = nextScale / oldScale;
+        const positionDelta = new THREE.Vector3(
+            nextPosition.x - oldPosition.x,
+            nextPosition.y - oldPosition.y,
+            nextPosition.z - oldPosition.z,
+        );
+        const updatedInstancedMeshes = new Set<THREE.InstancedMesh>();
+        for (const candidate of matchingRecords) {
+            this.ensureObjectRecordDefaultTransform(candidate);
+            candidate.selection.position = { ...nextPosition };
+            candidate.selection.scale = nextScale;
+            candidate.approximateRadius *= scaleRatio;
+
+            if (candidate.object3D) {
+                candidate.object3D.position.set(nextPosition.x, nextPosition.y, nextPosition.z);
+                candidate.object3D.scale.setScalar(nextScale);
+                candidate.object3D.updateMatrix();
+                candidate.object3D.updateMatrixWorld(true);
+            } else if (candidate.instancedMesh && typeof candidate.instanceId === 'number') {
+                this.updateInstancedObjectTransform(candidate, positionDelta, scaleRatio);
+                updatedInstancedMeshes.add(candidate.instancedMesh);
+            }
+        }
+
+        for (const instancedMesh of updatedInstancedMeshes) {
+            instancedMesh.instanceMatrix.needsUpdate = true;
+            instancedMesh.computeBoundingBox();
+            instancedMesh.computeBoundingSphere();
+        }
+    }
+
+    private ensureObjectRecordDefaultTransform(record: TerrainObjectSelectionRecord) {
+        const selectionWithDefault = record.selection as SelectedWorldObjectRef & {
+            userDataDefaultTransform?: {
+                position: ExplorerVector3;
+                scale: number;
+                approximateRadius: number;
+            };
+        };
+        if (selectionWithDefault.userDataDefaultTransform) {
+            return;
+        }
+
+        selectionWithDefault.userDataDefaultTransform = {
+            position: { ...record.selection.position },
+            scale: record.selection.scale,
+            approximateRadius: record.approximateRadius,
+        };
+    }
+
+    private restoreObjectDefaultTransformForRecords(records: TerrainObjectSelectionRecord[]) {
+        if (records.length === 0) return;
+        const defaultTransform = (records[0].selection as SelectedWorldObjectRef & {
+            userDataDefaultTransform?: {
+                position: ExplorerVector3;
+                scale: number;
+            };
+        }).userDataDefaultTransform;
+        if (!defaultTransform) return;
+
+        this.applyTransformToObjectRecords(records, defaultTransform.position, defaultTransform.scale);
+    }
+
+    private updateInstancedObjectTransform(
+        record: TerrainObjectSelectionRecord,
+        positionDelta: THREE.Vector3,
+        scaleRatio: number,
+    ) {
+        if (!record.instancedMesh || typeof record.instanceId !== 'number') return;
+
+        const matrix = new THREE.Matrix4();
+        const position = new THREE.Vector3();
+        const rotation = new THREE.Quaternion();
+        const scale = new THREE.Vector3();
+        record.instancedMesh.getMatrixAt(record.instanceId, matrix);
+        matrix.decompose(position, rotation, scale);
+        position.add(positionDelta);
+        scale.multiplyScalar(scaleRatio);
+        matrix.compose(position, rotation, scale);
+        record.instancedMesh.setMatrixAt(record.instanceId, matrix);
+    }
+
+    private async saveSelectedObjectTypeSettings() {
+        const record = this.selectedObjectRecord;
+        if (!record) return;
+
+        const materials: Record<string, TerrainObjectMaterialOverride> = {};
+        for (const binding of this.collectMaterialBindingsForType(record.selection.worldNumber, record.selection.type)) {
+            materials[binding.key] = this.getMaterialOverrideFromMaterial(binding.materials[0]);
+        }
+
+        this.objectOverrides = upsertTerrainObjectTypeOverride(
+            this.objectOverrides,
+            record.selection.worldNumber,
+            record.selection.type,
+            { materials },
+        );
+        this.objectOverrides = upsertTerrainObjectTransformOverride(
+            this.objectOverrides,
+            record.selection.worldNumber,
+            record.selection.objectId,
+            {
+                position: { ...record.selection.position },
+                scale: record.selection.scale,
+            },
+        );
+        await this.writeObjectOverrides('Saved object settings');
+    }
+
+    private async resetSelectedObjectTypeSettings() {
+        const record = this.selectedObjectRecord;
+        if (!record) return;
+
+        this.objectOverrides = removeTerrainObjectTypeOverride(
+            this.objectOverrides,
+            record.selection.worldNumber,
+            record.selection.type,
+        );
+        this.objectOverrides = removeTerrainObjectTransformOverride(
+            this.objectOverrides,
+            record.selection.worldNumber,
+            record.selection.objectId,
+        );
+        const matchingRecords = this.objectRecords.filter(candidate => candidate.selection.objectId === record.selection.objectId);
+        this.restoreObjectDefaultTransformForRecords(matchingRecords);
+        this.restoreMaterialDefaultsForType(record.selection.worldNumber, record.selection.type);
+        this.updateObjectInspector();
+        this.updateSelectionMarker();
+        this.populateObjectEditorPanel();
+        await this.writeObjectOverrides('Reset object settings');
+    }
+
+    private applyPersistedObjectTypeOverridesForWorld(worldNumber: number) {
+        const worldOverrides = this.objectOverrides.worlds[String(worldNumber)];
+        if (!worldOverrides) return;
+
+        for (const [objectId, transformOverride] of Object.entries(worldOverrides.objects)) {
+            const matchingRecords = this.objectRecords.filter(candidate => candidate.selection.objectId === objectId);
+            this.applyTransformToObjectRecords(
+                matchingRecords,
+                transformOverride.position,
+                transformOverride.scale,
+            );
+        }
+
+        for (const [typeKey, typeOverride] of Object.entries(worldOverrides.objectTypes)) {
+            const objectType = parseInt(typeKey, 10);
+            if (Number.isNaN(objectType)) continue;
+            for (const [materialKey, materialOverride] of Object.entries(typeOverride.materials)) {
+                this.applyMaterialOverrideToType(worldNumber, objectType, materialKey, materialOverride);
+            }
+        }
+    }
+
+    private applyMaterialOverrideToType(
+        worldNumber: number,
+        objectType: number,
+        materialKey: string,
+        materialOverride: TerrainObjectMaterialOverride,
+    ) {
+        for (const binding of this.collectMaterialBindingsForType(worldNumber, objectType)) {
+            if (binding.key !== materialKey) continue;
+            binding.materials.forEach(material => this.applyMaterialOverrideToMaterial(material, materialOverride));
+        }
+    }
+
+    private restoreMaterialDefaultsForType(worldNumber: number, objectType: number) {
+        for (const binding of this.collectMaterialBindingsForType(worldNumber, objectType)) {
+            binding.materials.forEach(material => this.restoreMaterialDefault(material));
+        }
+    }
+
+    private collectMaterialBindingsForType(worldNumber: number, objectType: number): TerrainMaterialBinding[] {
+        if (!this.objectsGroup) return [];
+
+        const bindingMap = new Map<string, { key: string; label: string; materialSet: Set<THREE.Material> }>();
+        this.objectsGroup.traverse(obj => {
+            const mesh = obj as THREE.Mesh;
+            if (!mesh.isMesh) return;
+
+            const directRecord = mesh.userData.terrainObjectRecord as TerrainObjectSelectionRecord | undefined;
+            const instancedRecords = mesh.userData.terrainObjectRecords as TerrainObjectSelectionRecord[] | undefined;
+            const record = directRecord ?? instancedRecords?.[0];
+            if (!record || record.selection.worldNumber !== worldNumber || record.selection.type !== objectType) {
+                return;
+            }
+
+            const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            materials.forEach((material, index) => {
+                if (!material) return;
+                this.ensureMaterialDefault(material);
+                const key = `${this.getStableMeshMaterialKey(mesh.name)}:${index}`;
+                const existing = bindingMap.get(key);
+                if (existing) {
+                    existing.materialSet.add(material);
+                } else {
+                    bindingMap.set(key, {
+                        key,
+                        label: `${this.getStableMeshMaterialKey(mesh.name)} material ${index + 1}`,
+                        materialSet: new Set([material]),
+                    });
+                }
+            });
+        });
+
+        return [...bindingMap.values()]
+            .sort((a, b) => a.key.localeCompare(b.key))
+            .map(binding => ({
+                key: binding.key,
+                label: binding.label,
+                materials: [...binding.materialSet],
+            }));
+    }
+
+    private getStableMeshMaterialKey(meshName: string): string {
+        const base = meshName || 'mesh';
+        return base.replace(/_(all|-?\d+:-?\d+)$/, '');
+    }
+
+    private getMaterialOverrideFromMaterial(material: THREE.Material): TerrainObjectMaterialOverride {
+        return {
+            blending: TERRAIN_THREE_BLEND_TO_OBJECT_MODE.get(material.blending) ?? 'Normal',
+            alphaTest: this.getMaterialBlackKeyThreshold(material),
+        };
+    }
+
+    private applyMaterialOverrideToMaterial(material: THREE.Material, materialOverride: TerrainObjectMaterialOverride) {
+        this.ensureMaterialDefault(material);
+        const defaults = this.getMaterialDefault(material);
+        const blending = TERRAIN_OBJECT_BLEND_MODE_TO_THREE[materialOverride.blending];
+        material.blending = blending;
+        material.transparent = blending !== THREE.NoBlending;
+        material.depthWrite = blending === THREE.NoBlending;
+        if ('alphaTest' in material) {
+            (material as THREE.MeshPhongMaterial).alphaTest = defaults.alphaTest;
+        }
+        this.rememberTerrainObjectBlackKeyBase(material);
+        material.userData.terrainObjectBlackKeyThreshold = Math.max(0, Math.min(0.5, materialOverride.alphaTest));
+        this.applyTerrainObjectBlackKeyThresholdToMaterial(material);
+    }
+
+    private ensureMaterialDefault(material: THREE.Material) {
+        if (material.userData.terrainObjectDefaultMaterial) {
+            return;
+        }
+
+        material.userData.terrainObjectDefaultMaterial = {
+            blending: material.blending,
+            transparent: material.transparent,
+            depthWrite: material.depthWrite,
+            alphaTest: 'alphaTest' in material ? (material as THREE.MeshPhongMaterial).alphaTest : 0,
+        };
+    }
+
+    private getMaterialDefault(material: THREE.Material): {
+        blending: THREE.Blending;
+        transparent: boolean;
+        depthWrite: boolean;
+        alphaTest: number;
+    } {
+        this.ensureMaterialDefault(material);
+        return material.userData.terrainObjectDefaultMaterial as {
+            blending: THREE.Blending;
+            transparent: boolean;
+            depthWrite: boolean;
+            alphaTest: number;
+        };
+    }
+
+    private restoreMaterialDefault(material: THREE.Material) {
+        const defaults = material.userData.terrainObjectDefaultMaterial as {
+            blending: THREE.Blending;
+            transparent: boolean;
+            depthWrite: boolean;
+            alphaTest: number;
+        } | undefined;
+        if (!defaults) return;
+
+        material.blending = defaults.blending;
+        material.transparent = defaults.transparent;
+        material.depthWrite = defaults.depthWrite;
+        if ((material as THREE.MeshPhongMaterial).map) {
+            this.disposeTerrainObjectDerivedAlphaTexture((material as THREE.MeshPhongMaterial).map!);
+        }
+        if ('alphaMap' in material) {
+            (material as THREE.MeshPhongMaterial).alphaMap = null;
+        }
+        if ('alphaTest' in material) {
+            (material as THREE.MeshPhongMaterial).alphaTest = defaults.alphaTest;
+        }
+        delete material.userData.terrainObjectBlackKeyThreshold;
+        delete material.userData.terrainObjectBlackKeyBase;
+        material.needsUpdate = true;
+    }
+
+    private rememberTerrainObjectBlackKeyBase(material: THREE.Material) {
+        material.userData.terrainObjectBlackKeyBase = {
+            alphaTest: 'alphaTest' in material ? (material as THREE.MeshPhongMaterial).alphaTest : 0,
+            transparent: material.transparent,
+            depthWrite: material.depthWrite,
+            blending: material.blending,
+        };
+    }
+
+    private getMaterialBlackKeyThreshold(material: THREE.Material): number {
+        const stored = material.userData.terrainObjectBlackKeyThreshold;
+        return typeof stored === 'number' ? Math.max(0, Math.min(0.5, stored)) : 0;
+    }
+
+    private applyTerrainObjectBlackKeyThresholdToMaterial(material: THREE.Material) {
+        if (!(material instanceof THREE.MeshPhongMaterial)) {
+            material.needsUpdate = true;
+            return;
+        }
+
+        const base = material.userData.terrainObjectBlackKeyBase as {
+            alphaTest: number;
+            transparent: boolean;
+            depthWrite: boolean;
+            blending: THREE.Blending;
+        } | undefined;
+        const threshold = this.getMaterialBlackKeyThreshold(material);
+
+        if (!base) {
+            this.rememberTerrainObjectBlackKeyBase(material);
+            this.applyTerrainObjectBlackKeyThresholdToMaterial(material);
+            return;
+        }
+
+        if (!material.map || threshold <= 0) {
+            material.alphaMap = null;
+            material.alphaTest = base.alphaTest;
+            material.transparent = base.transparent;
+            material.depthWrite = base.depthWrite;
+            material.blending = base.blending;
+            material.needsUpdate = true;
+            return;
+        }
+
+        const alphaMap = this.ensureTerrainObjectBlackKeyAlphaMap(material.map);
+        if (!alphaMap) {
+            material.alphaMap = null;
+            material.alphaTest = base.alphaTest;
+            material.transparent = base.transparent;
+            material.depthWrite = base.depthWrite;
+            material.blending = base.blending;
+            material.needsUpdate = true;
+            return;
+        }
+
+        material.alphaMap = alphaMap;
+        material.alphaTest = Math.max(base.alphaTest, threshold);
+        material.transparent = base.transparent;
+        material.depthWrite = base.depthWrite;
+        material.blending = base.blending;
+        material.needsUpdate = true;
+    }
+
+    private ensureTerrainObjectBlackKeyAlphaMap(texture: THREE.Texture): THREE.Texture | null {
+        const cached = texture.userData?.terrainObjectBlackKeyAlphaMap as THREE.Texture | undefined;
+        if (cached) {
+            return cached;
+        }
+
+        const sourceImage = texture.image;
+        if (!this.isDrawableTextureImage(sourceImage)) {
+            return null;
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = sourceImage.width;
+        canvas.height = sourceImage.height;
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) {
+            return null;
+        }
+
+        context.drawImage(sourceImage, 0, 0);
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        const pixels = imageData.data;
+        for (let index = 0; index < pixels.length; index += 4) {
+            const mask = Math.max(pixels[index], pixels[index + 1], pixels[index + 2]);
+            const originalAlpha = pixels[index + 3] / 255;
+            const value = Math.round(mask * originalAlpha);
+            pixels[index] = value;
+            pixels[index + 1] = value;
+            pixels[index + 2] = value;
+            pixels[index + 3] = 255;
+        }
+        context.putImageData(imageData, 0, 0);
+
+        const alphaMap = new THREE.CanvasTexture(canvas);
+        alphaMap.colorSpace = THREE.NoColorSpace;
+        alphaMap.wrapS = texture.wrapS;
+        alphaMap.wrapT = texture.wrapT;
+        alphaMap.flipY = texture.flipY;
+        alphaMap.name = `${texture.name || 'texture'}__terrain_black_key_alpha`;
+        alphaMap.needsUpdate = true;
+        texture.userData.terrainObjectBlackKeyAlphaMap = alphaMap;
+        return alphaMap;
+    }
+
+    private disposeTerrainObjectDerivedAlphaTexture(texture: THREE.Texture) {
+        const derived = texture.userData?.terrainObjectBlackKeyAlphaMap as THREE.Texture | undefined;
+        if (derived) {
+            derived.dispose();
+            delete texture.userData.terrainObjectBlackKeyAlphaMap;
+        }
+    }
+
+    private isDrawableTextureImage(
+        source: unknown,
+    ): source is CanvasImageSource & { width: number; height: number } {
+        if (!source) return false;
+        if (typeof source !== 'object' && typeof source !== 'function') return false;
+
+        const candidate = source as { width?: unknown; height?: unknown };
+        return typeof candidate.width === 'number' && typeof candidate.height === 'number';
+    }
+
+    private setObjectEditorStatus(message: string) {
+        if (this.objectEditorStatusEl) {
+            this.objectEditorStatusEl.textContent = message;
         }
     }
 

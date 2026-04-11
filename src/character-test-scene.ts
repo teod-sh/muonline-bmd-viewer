@@ -10,6 +10,13 @@ import { createId } from './explorer-store';
 import { parseItemBmd, ItemDefinition } from './item-bmd';
 import { SkinnedVertexNormalsHelper } from './helpers/SkinnedVertexNormalsHelper';
 import { Disposer } from './utils/Disposer';
+import { resolveAttachmentBoneByBmdIndex } from './utils/CharacterAttachmentBones';
+import {
+  disposeCharacterItemAnimations,
+  startCharacterItemAnimation,
+  updateCharacterItemAnimationSpeed,
+  type CharacterItemAnimationPlayback,
+} from './utils/CharacterItemAnimations';
 import { applyBlendModeToMaterial, detectBlendModeFromTexture, type BlendHeuristicResult } from './utils/TextureBlendHeuristics';
 import GIF from 'gif.js';
 import gifWorkerUrl from 'gif.js/dist/gif.worker.js?url';
@@ -121,6 +128,7 @@ export class CharacterTestScene {
 
   private mixer: THREE.AnimationMixer | null = null;
   private currentAction: THREE.AnimationAction | null = null;
+  private itemAnimationPlaybacks: CharacterItemAnimationPlayback[] = [];
 
   private readonly bmdLoader = new BMDLoader();
   private textureLoader = new THREE.TextureLoader();
@@ -136,6 +144,7 @@ export class CharacterTestScene {
 
   private characterRoot: THREE.Group | null = null;
   private baseSkeleton: THREE.Skeleton | null = null;
+  private baseBmdBones: THREE.Bone[] | null = null;
   private baseBindMatrix: THREE.Matrix4 | null = null;
   private characterOffset = new THREE.Vector3();
   private readonly characterHeightOffset = 80;
@@ -874,6 +883,7 @@ export class CharacterTestScene {
       this.statusEl.textContent = 'No skeleton found in base model.';
       return;
     }
+    this.baseBmdBones = this.getBmdBones(this.characterRoot);
     this.baseBindMatrix = this.findBaseBindMatrix(this.characterRoot);
 
     await this.applyTexturesForGroup(baseGroup.group);
@@ -959,6 +969,7 @@ export class CharacterTestScene {
         this.applySceneMaterialTuning(part.group);
         this.attachToBone(part.group, entry.bone ?? 0);
         await this.applyTexturesForGroup(part.group);
+        this.startItemAnimation(part.group);
       }
     }
 
@@ -1130,7 +1141,7 @@ export class CharacterTestScene {
 
   private attachToBone(group: THREE.Group, boneIndex: number) {
     if (!this.baseSkeleton) return;
-    const bone = this.baseSkeleton.bones[boneIndex];
+    const bone = resolveAttachmentBoneByBmdIndex(this.baseSkeleton.bones, this.baseBmdBones, boneIndex);
     if (!bone) {
       console.warn(`[CharacterTestScene] Missing bone ${boneIndex}`);
       return;
@@ -1141,6 +1152,13 @@ export class CharacterTestScene {
     group.scale.set(1, 1, 1);
 
     bone.add(group);
+  }
+
+  private startItemAnimation(group: THREE.Group) {
+    const playback = startCharacterItemAnimation(group, group.animations, this.animationSpeed);
+    if (playback) {
+      this.itemAnimationPlaybacks.push(playback);
+    }
   }
 
   private async applyTexturesForGroup(group: THREE.Group) {
@@ -1185,6 +1203,11 @@ export class CharacterTestScene {
         applyBlendModeToMaterial(mat, blendResult);
       }
     });
+  }
+
+  private getBmdBones(group: THREE.Group): THREE.Bone[] | null {
+    const bones = group.userData.bmdBones;
+    return Array.isArray(bones) ? bones as THREE.Bone[] : null;
   }
 
   private applyItemShader(mesh: THREE.Mesh, texture: THREE.Texture, blendResult: BlendHeuristicResult) {
@@ -1629,6 +1652,7 @@ export class CharacterTestScene {
     if (this.currentAction) {
       this.currentAction.setEffectiveTimeScale(speed);
     }
+    updateCharacterItemAnimationSpeed(this.itemAnimationPlaybacks, speed);
   }
 
   private setCharacterScale(scale: number) {
@@ -2145,11 +2169,13 @@ export class CharacterTestScene {
 
     this.characterRoot = null;
     this.baseSkeleton = null;
+    this.baseBmdBones = null;
     this.baseBindMatrix = null;
 
     // Properly dispose mixer before setting to null
     this.mixer = Disposer.disposeMixer(this.mixer);
     this.currentAction = null;
+    disposeCharacterItemAnimations(this.itemAnimationPlaybacks);
 
     if (this.skeletonHelper) {
       this.scene.remove(this.skeletonHelper);
@@ -2252,6 +2278,9 @@ export class CharacterTestScene {
 
     if (this.mixer && !this.isRecordingGif) {
       this.mixer.update(delta);
+    }
+    if (this.itemAnimationPlaybacks.length && !this.isRecordingGif) {
+      this.itemAnimationPlaybacks.forEach(playback => playback.mixer.update(delta));
     }
 
     if (this.itemShaderMaterials.size) {

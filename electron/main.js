@@ -5,9 +5,14 @@ const fs = require('fs').promises;
 
 let mainWindow;
 const missingReadFiles = new Set();
+const TERRAIN_OBJECT_OVERRIDES_FILE = 'terrain-object-overrides.json';
 
 function isMissingPathError(error) {
   return error && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
+}
+
+function getTerrainObjectOverridesPath() {
+  return path.join(app.getPath('userData'), TERRAIN_OBJECT_OVERRIDES_FILE);
 }
 
 async function readDirectoryFilesRecursive(rootDir, keyPrefix) {
@@ -290,6 +295,48 @@ ipcMain.handle('fs:searchTextures', async (event, startPath, requiredTextures) =
   }
 
   return foundTextures;
+});
+
+ipcMain.handle('fs:readTerrainObjectOverrides', async () => {
+  const filePath = getTerrainObjectOverridesPath();
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return {
+      path: filePath,
+      data: JSON.parse(raw),
+    };
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return {
+        path: filePath,
+        data: null,
+      };
+    }
+
+    console.error('[fs:readTerrainObjectOverrides] Error reading overrides:', error);
+    return {
+      path: filePath,
+      data: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('fs:writeTerrainObjectOverrides', async (event, data) => {
+  const filePath = getTerrainObjectOverridesPath();
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    return {
+      path: filePath,
+    };
+  } catch (error) {
+    console.error('[fs:writeTerrainObjectOverrides] Error writing overrides:', error);
+    return {
+      path: filePath,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 });
 
 app.whenReady().then(createWindow);
