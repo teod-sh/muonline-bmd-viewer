@@ -283,7 +283,6 @@ class App {
 
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x0b1322);
-        this.scene.fog = new THREE.FogExp2(0x0b1322, 0.00125);
 
         this.camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 10000);
         this.camera.position.set(0, 200, 400);
@@ -604,6 +603,9 @@ class App {
         const texInput  = document.getElementById('texture-file-input') as HTMLInputElement;
         this.exportBtn = document.getElementById('export-textures-btn') as HTMLButtonElement;
         this.exportBtn.addEventListener('click', () => this.exportTextures());
+
+        const removeTexturesBtn = document.getElementById('remove-textures-btn') as HTMLButtonElement;
+        removeTexturesBtn.addEventListener('click', () => this.removeTextures());
         
         const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
         const speedLabel = document.getElementById('speed-label')!;
@@ -1965,6 +1967,33 @@ class App {
         status.textContent = `Error: ${(e as Error).message}`;
         return false;
         }
+    }
+
+    private removeTextures() {
+        if (!this.loadedGroup) return;
+        this.loadedGroup.traverse(obj => {
+            const mesh = obj as THREE.Mesh;
+            if (!mesh.isMesh) return;
+            const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            materials.forEach(mat => {
+                const phong = mat as THREE.MeshPhongMaterial;
+                if (phong.map) {
+                    this.disposeDerivedAlphaTexture(phong.map);
+                    phong.map.dispose();
+                    phong.map = null;
+                    phong.alphaMap = null;
+                }
+                phong.color.set(0xcccccc);
+                phong.transparent = false;
+                phong.depthWrite = true;
+                phong.blending = THREE.NormalBlending;
+                phong.alphaTest = 0;
+                phong.needsUpdate = true;
+            });
+        });
+        this.appliedTextureFiles.clear();
+        const status = document.getElementById('status');
+        if (status) status.textContent = 'Textures removed.';
     }
 
     private isDrawableTextureImage(
