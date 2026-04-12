@@ -93,7 +93,7 @@ export class TerrainLoader {
         const geometry = buildTerrainGeometry(heightData, attData, lightData);
 
         const mesh = materialMode === 'atlas-geometry'
-            ? createTerrainAtlasGeometryMesh(geometry, attData, atlas, mapData, !!lightData)
+            ? await createTerrainAtlasGeometryMesh(geometry, attData, atlas, mapData, !!lightData)
             : new THREE.Mesh(geometry, createTerrainMaterial(atlas, mapData, !!lightData, materialMode));
 
         if (materialMode === 'baked') {

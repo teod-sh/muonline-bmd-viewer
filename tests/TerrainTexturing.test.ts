@@ -45,7 +45,7 @@ describe('TerrainTexturing', () => {
     expect((material as THREE.MeshBasicMaterial).vertexColors).toBe(true);
   });
 
-  it('builds atlas-uv terrain meshes instead of baking WebGPU terrain into one low-res texture', () => {
+  it('builds atlas-uv terrain meshes instead of baking WebGPU terrain into one low-res texture', async () => {
     const sourceGeometry = createSourceTerrainGeometry();
     const attributes = createTerrainAttributes();
     const mapping = createTerrainMapping();
@@ -62,7 +62,7 @@ describe('TerrainTexturing', () => {
       tileUvScale: 1,
     };
 
-    const mesh = createTerrainAtlasGeometryMesh(sourceGeometry, attributes, atlas, mapping, true);
+    const mesh = await createTerrainAtlasGeometryMesh(sourceGeometry, attributes, atlas, mapping, true);
     const overlay = mesh.children[0] as THREE.Mesh;
 
     expect(mesh.geometry.getAttribute('uv').count).toBe(TERRAIN_SIZE * TERRAIN_SIZE * 4);

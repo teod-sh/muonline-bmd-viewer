@@ -1,6 +1,5 @@
 // src/terrain-scene.ts
 import * as THREE from 'three';
-import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { ExplorerBookmark, ExplorerVector3, SelectedWorldObjectRef, TerrainSessionState } from './explorer-types';
 import { createId } from './explorer-store';
@@ -12,7 +11,7 @@ import {
     type TerrainObjectSelectionRecord,
 } from './terrain/TerrainObjects';
 import {
-    getTerrainObjectCullingChunkKeys,
+    TerrainObjectCullingIndex,
     getTerrainObjectDrawRangeSphere,
 } from './terrain/TerrainObjectCulling';
 import {
@@ -49,6 +48,13 @@ import {
     upsertTerrainObjectTransformOverride,
     upsertTerrainObjectTypeOverride,
 } from './terrain/TerrainObjectOverrides';
+import {
+    createPreferredRenderer,
+    getActiveRendererBackend,
+    isWebGLRenderer,
+    type RendererBackendActive as SharedRendererBackendActive,
+    type SupportedRenderer,
+} from './rendering/RendererBackend';
 
 const TERRAIN_BASE_AMBIENT_INTENSITY = 0.6;
 const TERRAIN_BASE_SUN_INTENSITY = 1.0;
@@ -60,9 +66,8 @@ const TERRAIN_OBJECT_CULL_INTERVAL_MS = 120;
 const TERRAIN_CAMERA_MOVE_SPEED = 7000;
 const TERRAIN_CAMERA_SPRINT_MULTIPLIER = 2.2;
 const TERRAIN_MAX_DELTA_SECONDS = 0.1;
-type SupportedRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
 type TerrainRendererBackendPreference = TerrainSessionState['rendererBackend'];
-type TerrainRendererBackendActive = 'webgpu' | 'webgl';
+type TerrainRendererBackendActive = SharedRendererBackendActive;
 type TerrainMaterialBinding = {
     key: string;
     label: string;
@@ -114,10 +119,7 @@ export class TerrainScene {
     private sunLight: THREE.DirectionalLight | null = null;
     private objectDrawDistance = TERRAIN_OBJECT_DRAW_DISTANCE_DEFAULT;
     private objectCullLastUpdateMs = 0;
-    private objectCullingBuckets = new Map<string, THREE.Object3D[]>();
-    private objectCullingFallbacks: THREE.Object3D[] = [];
-    private objectCullingVisible = new Set<THREE.Object3D>();
-    private objectCullingMaxRadius = 0;
+    private readonly objectCullingIndex = new TerrainObjectCullingIndex();
     private readonly tempCullCenter = new THREE.Vector3();
     private readonly tempCullScale = new THREE.Vector3();
     private readonly frustum = new THREE.Frustum();
@@ -391,12 +393,8 @@ export class TerrainScene {
         return renderer;
     }
 
-    private createPreferredRenderer(preference: TerrainRendererBackendPreference): SupportedRenderer {
-        if (preference === 'webgl') {
-            return this.createClassicWebGLRenderer();
-        }
-
-        return new WebGPURenderer({
+    private createPreferredRenderer(preference: TerrainRendererBackendPreference): Promise<SupportedRenderer> {
+        return createPreferredRenderer(preference, () => this.createClassicWebGLRenderer(), {
             antialias: false,
         });
     }
@@ -447,11 +445,7 @@ export class TerrainScene {
     }
 
     private getActiveRendererBackend(renderer: SupportedRenderer): TerrainRendererBackendActive {
-        if (renderer instanceof THREE.WebGLRenderer) {
-            return 'webgl';
-        }
-
-        return (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? 'webgpu' : 'webgl';
+        return getActiveRendererBackend(renderer);
     }
 
     private updateRendererStatus(message?: string) {
@@ -530,11 +524,11 @@ export class TerrainScene {
             this.clearWorldScene();
         }
 
-        let renderer = this.createPreferredRenderer(preference);
+        let renderer = await this.createPreferredRenderer(preference);
         this.configureRenderer(renderer);
         let fallbackReason: string | null = null;
 
-        if (!(renderer instanceof THREE.WebGLRenderer)) {
+        if (!isWebGLRenderer(renderer)) {
             try {
                 await renderer.init();
             } catch (error) {
@@ -975,7 +969,7 @@ export class TerrainScene {
             this.worldSelectEl.appendChild(opt);
         }
 
-        container.style.display = '';
+        container.classList.remove('initially-hidden');
     }
 
     /** Load a specific world by number */
@@ -2162,59 +2156,21 @@ export class TerrainScene {
     }
 
     private clearObjectCullingIndex() {
-        this.objectCullingBuckets = new Map();
-        this.objectCullingFallbacks = [];
-        this.objectCullingVisible.clear();
-        this.objectCullingMaxRadius = 0;
+        this.objectCullingIndex.clear();
     }
 
     private rebuildObjectCullingIndex() {
         this.clearObjectCullingIndex();
         if (!this.objectsGroup) return;
-
-        for (const child of this.objectsGroup.children) {
-            const { radius } = getTerrainObjectDrawRangeSphere(child, this.tempCullCenter, this.tempCullScale);
-            this.objectCullingMaxRadius = Math.max(this.objectCullingMaxRadius, radius);
-            child.visible = false;
-
-            const chunkKey = child.userData.terrainObjectChunkKey as string | undefined;
-            if (chunkKey) {
-                const bucket = this.objectCullingBuckets.get(chunkKey);
-                if (bucket) {
-                    bucket.push(child);
-                } else {
-                    this.objectCullingBuckets.set(chunkKey, [child]);
-                }
-                continue;
-            }
-
-            this.objectCullingFallbacks.push(child);
-        }
+        this.objectCullingIndex.rebuild(this.objectsGroup.children);
     }
 
     private collectObjectCullingCandidates(cameraPos: THREE.Vector3): Set<THREE.Object3D> {
-        const candidates = new Set<THREE.Object3D>(this.objectCullingFallbacks);
-        const range = this.objectDrawDistance + this.objectCullingMaxRadius;
-        const keys = getTerrainObjectCullingChunkKeys(
-            cameraPos.x,
-            cameraPos.z,
-            range,
+        return this.objectCullingIndex.collectCandidates(
+            cameraPos,
+            this.objectDrawDistance,
             TERRAIN_OBJECT_INSTANCE_CHUNK_WORLD_SIZE,
         );
-
-        for (const key of keys) {
-            const bucket = this.objectCullingBuckets.get(key);
-            if (!bucket) continue;
-            for (const child of bucket) {
-                candidates.add(child);
-            }
-        }
-
-        for (const child of this.objectCullingVisible) {
-            candidates.add(child);
-        }
-
-        return candidates;
     }
 
     private updateObjectDistanceCulling(force = false) {
@@ -2226,11 +2182,11 @@ export class TerrainScene {
         }
 
         if (this.isolatedObjectRecord) {
-            this.objectCullingVisible.clear();
+            this.objectCullingIndex.clearVisible();
             for (const child of this.objectsGroup.children) {
                 child.visible = this.isChildVisibleForIsolatedRecord(child, this.isolatedObjectRecord);
                 if (child.visible) {
-                    this.objectCullingVisible.add(child);
+                    this.objectCullingIndex.addVisible(child);
                 }
             }
             this.objectCullLastUpdateMs = now;
@@ -2254,13 +2210,13 @@ export class TerrainScene {
             }
         }
 
-        for (const child of this.objectCullingVisible) {
+        this.objectCullingIndex.forEachVisible(child => {
             if (!nextVisible.has(child)) {
                 child.visible = false;
             }
-        }
+        });
 
-        this.objectCullingVisible = nextVisible;
+        this.objectCullingIndex.replaceVisible(nextVisible);
         this.objectCullLastUpdateMs = now;
     }
 
@@ -2323,12 +2279,11 @@ export class TerrainScene {
         if (!this.renderer) {
             return 1;
         }
-        if (this.renderer instanceof THREE.WebGLRenderer) {
+        if (isWebGLRenderer(this.renderer)) {
             return this.renderer.capabilities.getMaxAnisotropy();
         }
 
-        const backend = this.renderer.backend as { getMaxAnisotropy?: () => number };
-        const value = backend.getMaxAnisotropy?.();
+        const value = this.renderer.backend.getMaxAnisotropy?.();
         // WebGPU spec guarantees 16x anisotropy support; fallback if backend doesn't expose the method.
         return typeof value === 'number' && Number.isFinite(value) ? value : 16;
     }

@@ -1,6 +1,5 @@
 // src/terrain/TerrainTexturing.ts
 import * as THREE from 'three';
-import { sRGBTransferEOTF, texture, uv, vec4, vertexColor } from 'three/tsl';
 import { TERRAIN_SIZE, TWFlags, type TerrainAttributeData } from './formats/ATTReader';
 import type { TerrainMappingData } from './formats/MAPReader';
 
@@ -307,15 +306,15 @@ export function createTerrainMaterial(
     });
 }
 
-export function createTerrainAtlasGeometryMesh(
+export async function createTerrainAtlasGeometryMesh(
     sourceGeometry: THREE.BufferGeometry,
     attributes: TerrainAttributeData,
     atlas: TerrainAtlas,
     mapping: TerrainMappingData,
     useLightmap: boolean,
-): THREE.Mesh {
+): Promise<THREE.Mesh> {
     const baseGeometry = createTerrainAtlasLayerGeometry(sourceGeometry, attributes, atlas, mapping, 'layer1', useLightmap);
-    const baseMaterial = createTerrainAtlasGeometryMaterial(atlas.texture, false);
+    const baseMaterial = await createTerrainAtlasGeometryMaterial(atlas.texture, false);
     const baseMesh = new THREE.Mesh(baseGeometry, baseMaterial);
     baseMesh.name = 'terrain';
     baseMesh.userData.minimapGeometry = sourceGeometry;
@@ -324,7 +323,7 @@ export function createTerrainAtlasGeometryMesh(
     const overlayGeometry = createTerrainAtlasLayerGeometry(sourceGeometry, attributes, atlas, mapping, 'layer2', useLightmap);
     const overlayPosition = overlayGeometry.getAttribute('position');
     if (overlayPosition && overlayPosition.count > 0) {
-        const overlayMaterial = createTerrainAtlasGeometryMaterial(atlas.texture, true);
+        const overlayMaterial = await createTerrainAtlasGeometryMaterial(atlas.texture, true);
         const overlayMesh = new THREE.Mesh(overlayGeometry, overlayMaterial);
         overlayMesh.name = 'terrain_overlay';
         overlayMesh.renderOrder = 1;
@@ -336,7 +335,7 @@ export function createTerrainAtlasGeometryMesh(
     return baseMesh;
 }
 
-function createTerrainAtlasGeometryMaterial(map: THREE.Texture, transparent: boolean): THREE.MeshBasicMaterial {
+async function createTerrainAtlasGeometryMaterial(map: THREE.Texture, transparent: boolean): Promise<THREE.MeshBasicMaterial> {
     const material = new THREE.MeshBasicMaterial({
         map,
         side: THREE.FrontSide,
@@ -347,6 +346,7 @@ function createTerrainAtlasGeometryMaterial(map: THREE.Texture, transparent: boo
 
     // The reference terrain shader multiplies texture and lightmap values in gamma/sRGB space.
     // WebGPU node materials output linear working color, so feed linearized gamma-space output.
+    const { sRGBTransferEOTF, texture, uv, vec4, vertexColor } = await import('three/tsl');
     const gammaColor = texture(map, uv()).mul(vertexColor());
     (material as THREE.MeshBasicMaterial & { colorNode?: unknown }).colorNode = vec4(
         sRGBTransferEOTF(gammaColor.rgb),

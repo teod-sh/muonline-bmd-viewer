@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import {
+    TerrainObjectCullingIndex,
     getTerrainObjectCullingChunkKeys,
     getTerrainObjectDrawRangeSphere,
 } from '../src/terrain/TerrainObjectCulling';
@@ -31,5 +32,43 @@ describe('TerrainObjectCulling', () => {
             '0:2', '1:2', '2:2',
             '0:3', '1:3', '2:3',
         ]);
+    });
+
+    it('indexes chunked and fallback objects for distance culling passes', () => {
+        const nearChunked = new THREE.Object3D();
+        nearChunked.userData.terrainObjectChunkKey = '0:0';
+        nearChunked.visible = true;
+
+        const farChunked = new THREE.Object3D();
+        farChunked.userData.terrainObjectChunkKey = '5:0';
+        farChunked.visible = true;
+
+        const fallback = new THREE.Object3D();
+        fallback.visible = true;
+
+        const index = new TerrainObjectCullingIndex();
+        index.rebuild([nearChunked, farChunked, fallback]);
+
+        expect(nearChunked.visible).toBe(false);
+        expect(farChunked.visible).toBe(false);
+        expect(fallback.visible).toBe(false);
+
+        const initialCandidates = index.collectCandidates(
+            new THREE.Vector3(10, 0, 10),
+            100,
+            1000,
+        );
+        expect(initialCandidates.has(nearChunked)).toBe(true);
+        expect(initialCandidates.has(fallback)).toBe(true);
+        expect(initialCandidates.has(farChunked)).toBe(false);
+
+        index.replaceVisible(new Set([farChunked]));
+
+        const nextCandidates = index.collectCandidates(
+            new THREE.Vector3(10, 0, 10),
+            100,
+            1000,
+        );
+        expect(nextCandidates.has(farChunked)).toBe(true);
     });
 });

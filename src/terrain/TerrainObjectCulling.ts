@@ -5,6 +5,90 @@ export interface TerrainObjectDrawRangeSphere {
     radius: number;
 }
 
+export class TerrainObjectCullingIndex {
+    private buckets = new Map<string, THREE.Object3D[]>();
+    private fallbacks: THREE.Object3D[] = [];
+    private visible = new Set<THREE.Object3D>();
+    private maxRadius = 0;
+    private readonly tempCenter = new THREE.Vector3();
+    private readonly tempScale = new THREE.Vector3();
+
+    clear(): void {
+        this.buckets = new Map();
+        this.fallbacks = [];
+        this.visible.clear();
+        this.maxRadius = 0;
+    }
+
+    rebuild(objects: Iterable<THREE.Object3D>): void {
+        this.clear();
+
+        for (const object of objects) {
+            const { radius } = getTerrainObjectDrawRangeSphere(object, this.tempCenter, this.tempScale);
+            this.maxRadius = Math.max(this.maxRadius, radius);
+            object.visible = false;
+
+            const chunkKey = object.userData.terrainObjectChunkKey as string | undefined;
+            if (chunkKey) {
+                const bucket = this.buckets.get(chunkKey);
+                if (bucket) {
+                    bucket.push(object);
+                } else {
+                    this.buckets.set(chunkKey, [object]);
+                }
+                continue;
+            }
+
+            this.fallbacks.push(object);
+        }
+    }
+
+    collectCandidates(
+        cameraPosition: THREE.Vector3,
+        drawDistance: number,
+        chunkSize: number,
+    ): Set<THREE.Object3D> {
+        const candidates = new Set<THREE.Object3D>(this.fallbacks);
+        const range = drawDistance + this.maxRadius;
+        const keys = getTerrainObjectCullingChunkKeys(
+            cameraPosition.x,
+            cameraPosition.z,
+            range,
+            chunkSize,
+        );
+
+        for (const key of keys) {
+            const bucket = this.buckets.get(key);
+            if (!bucket) continue;
+            for (const object of bucket) {
+                candidates.add(object);
+            }
+        }
+
+        for (const object of this.visible) {
+            candidates.add(object);
+        }
+
+        return candidates;
+    }
+
+    clearVisible(): void {
+        this.visible.clear();
+    }
+
+    addVisible(object: THREE.Object3D): void {
+        this.visible.add(object);
+    }
+
+    replaceVisible(objects: Set<THREE.Object3D>): void {
+        this.visible = objects;
+    }
+
+    forEachVisible(callback: (object: THREE.Object3D) => void): void {
+        this.visible.forEach(callback);
+    }
+}
+
 export function getTerrainObjectCullingChunkKeys(
     worldX: number,
     worldZ: number,
