@@ -138,11 +138,8 @@ function initConsoleInterception(output: HTMLElement): void {
             output.removeChild(output.firstChild!);
         }
 
-        // Auto-scroll only when already at/near bottom
-        const nearBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 80;
-        if (nearBottom) {
-            output.scrollTop = output.scrollHeight;
-        }
+        // Keep the newest log entry visible.
+        output.scrollTop = output.scrollHeight;
     }
 
     const origLog   = console.log.bind(console);
