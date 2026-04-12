@@ -45,6 +45,9 @@ import {
     selectPreferredTexturePaths,
 } from './utils/TextureMatching';
 import './style.css';
+import { initPanels } from './panel-resize';
+
+initPanels();
 
 // == View ==
 let skeletonHelper: THREE.SkeletonHelper | null = null;

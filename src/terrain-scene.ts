@@ -11,6 +11,15 @@ import {
     type TerrainObjectLoadResult,
     type TerrainObjectSelectionRecord,
 } from './terrain/TerrainObjects';
+import {
+    getTerrainObjectCullingChunkKeys,
+    getTerrainObjectDrawRangeSphere,
+} from './terrain/TerrainObjectCulling';
+import {
+    getTerrainAnimatedInstancingModeForBackend,
+    TERRAIN_OBJECT_INSTANCE_CHUNK_WORLD_SIZE,
+} from './terrain/TerrainObjectInstancing';
+import { collectTerrainObjectWarmupTextures } from './terrain/TerrainObjectWarmup';
 import { updateTerrainObjectSelectionBox } from './terrain/TerrainObjectSelectionBounds';
 import {
     buildHeightMinimapRaster,
@@ -59,6 +68,11 @@ type TerrainMaterialBinding = {
     label: string;
     materials: THREE.Material[];
 };
+type TerrainObjectWarmupRenderer = SupportedRenderer & {
+    initTexture?: (texture: THREE.Texture) => void;
+    compile?: (scene: THREE.Object3D, camera: THREE.Camera, targetScene?: THREE.Scene | null) => unknown;
+    compileAsync?: (scene: THREE.Object3D, camera: THREE.Camera, targetScene?: THREE.Scene | null) => Promise<unknown>;
+};
 
 const TERRAIN_OBJECT_BLEND_MODE_TO_THREE: Record<TerrainObjectBlendModeName, THREE.Blending> = {
     Opaque: THREE.NoBlending,
@@ -100,6 +114,10 @@ export class TerrainScene {
     private sunLight: THREE.DirectionalLight | null = null;
     private objectDrawDistance = TERRAIN_OBJECT_DRAW_DISTANCE_DEFAULT;
     private objectCullLastUpdateMs = 0;
+    private objectCullingBuckets = new Map<string, THREE.Object3D[]>();
+    private objectCullingFallbacks: THREE.Object3D[] = [];
+    private objectCullingVisible = new Set<THREE.Object3D>();
+    private objectCullingMaxRadius = 0;
     private readonly tempCullCenter = new THREE.Vector3();
     private readonly tempCullScale = new THREE.Vector3();
     private readonly frustum = new THREE.Frustum();
@@ -1015,6 +1033,7 @@ export class TerrainScene {
             }
             if (this.objectsGroup) {
                 this.scene.remove(this.objectsGroup);
+                this.clearObjectCullingIndex();
             }
 
             this.terrainMesh = result.mesh;
@@ -1037,12 +1056,18 @@ export class TerrainScene {
                     (loaded, total) => {
                         if (this.statusEl) this.statusEl.textContent = `Loading objects: ${loaded}/${total}...`;
                     },
+                    {
+                        animatedInstancingMode: getTerrainAnimatedInstancingModeForBackend(this.rendererActiveBackend),
+                    },
                 );
                 this.objectsGroup = objectResult.group;
                 this.objectRecords = objectResult.records;
                 this.animatedObjectInstances = objectResult.animatedInstances;
                 this.scene.add(this.objectsGroup);
                 this.applyPersistedObjectTypeOverridesForWorld(result.mapNumber);
+                this.rebuildObjectCullingIndex();
+                await this.prewarmTerrainObjectResources(this.objectsGroup);
+                void this.prewarmTerrainObjectResourcesBackground(this.objectsGroup);
 
                 if (this.showObjectsEl && this.objectsGroup) {
                     this.objectsGroup.visible = this.showObjectsEl.checked;
@@ -1448,6 +1473,8 @@ export class TerrainScene {
             instancedMesh.computeBoundingBox();
             instancedMesh.computeBoundingSphere();
         }
+        this.rebuildObjectCullingIndex();
+        this.updateObjectDistanceCulling(true);
     }
 
     private ensureObjectRecordDefaultTransform(record: TerrainObjectSelectionRecord) {
@@ -2030,6 +2057,166 @@ export class TerrainScene {
         if (this.objectCountEl) this.objectCountEl.textContent = Math.max(0, objectCount).toLocaleString();
     }
 
+    private async prewarmTerrainObjectResources(root: THREE.Object3D) {
+        if (!this.renderer || !this.camera || !this.scene) return;
+
+        const renderer = this.renderer as TerrainObjectWarmupRenderer;
+
+        for (const texture of collectTerrainObjectWarmupTextures(root)) {
+            renderer.initTexture?.(texture);
+        }
+
+        if (!renderer.compileAsync) {
+            try {
+                renderer.compile?.(root, this.camera, this.scene);
+            } catch (error) {
+                console.warn('Terrain object resource pre-warm failed:', error);
+            }
+            return;
+        }
+
+        // Phase 1: compile what is currently in the camera frustum. This is the
+        // pre-fix behavior — fast, and ensures the renderer is initialized so
+        // phase 2's sync-trick is safe to rely on.
+        try {
+            await renderer.compileAsync(root, this.camera, this.scene);
+        } catch (error) {
+            console.warn('Terrain object resource pre-warm (visible pass) failed:', error);
+        }
+    }
+
+    private async prewarmTerrainObjectResourcesBackground(root: THREE.Object3D) {
+        if (!this.renderer || !this.camera || !this.scene) return;
+
+        const renderer = this.renderer as TerrainObjectWarmupRenderer;
+        if (!renderer.compileAsync) return;
+
+        // Phase 2: background compile of objects outside the camera frustum.
+        // WebGPU's compileAsync respects frustumCulled inside _projectObject, so
+        // anything off-screen at load time would otherwise compile on demand
+        // when the distance culler first reveals it — a visible hitch.
+        //
+        // We walk the object group one child at a time and rely on the fact
+        // that compileAsync is synchronous up to its final `await
+        // Promise.all(compilationPromises)` (see three/src/renderers/common/
+        // Renderer.js). That lets us force visible=true / frustumCulled=false
+        // only for the window where compileAsync builds the render list, then
+        // restore the flags before any await yields control. Render ticks that
+        // run between children therefore never observe forced-visible objects,
+        // so nothing flashes on screen.
+        //
+        // Between children we budget a few ms of work and then yield on rAF so
+        // the main thread stays responsive through the whole background pass.
+        const children = [...root.children];
+        const frameBudgetMs = 4;
+        let budgetStart =
+            typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+        for (const child of children) {
+            if (root !== this.objectsGroup) return; // world changed, cancel
+
+            const meshOverrides: THREE.Object3D[] = [];
+            const savedVisible = child.visible;
+            child.visible = true;
+            child.traverse(object => {
+                if (!(object as THREE.Mesh).isMesh) return;
+                if (!object.frustumCulled) return;
+                object.frustumCulled = false;
+                meshOverrides.push(object);
+            });
+
+            let compilePromise: Promise<unknown> | undefined;
+            try {
+                compilePromise = renderer.compileAsync(child, this.camera, this.scene);
+            } catch (error) {
+                console.warn('Terrain object resource pre-warm (background) failed:', error);
+            }
+
+            child.visible = savedVisible;
+            for (const mesh of meshOverrides) {
+                mesh.frustumCulled = true;
+            }
+
+            if (compilePromise) {
+                try {
+                    await compilePromise;
+                } catch (error) {
+                    console.warn('Terrain object resource pre-warm (background) compile rejected:', error);
+                }
+            }
+
+            const nowMs =
+                typeof performance !== 'undefined' ? performance.now() : Date.now();
+            if (nowMs - budgetStart > frameBudgetMs) {
+                await new Promise<void>(resolve => {
+                    if (typeof requestAnimationFrame === 'function') {
+                        requestAnimationFrame(() => resolve());
+                    } else {
+                        setTimeout(resolve, 0);
+                    }
+                });
+                budgetStart =
+                    typeof performance !== 'undefined' ? performance.now() : Date.now();
+            }
+        }
+    }
+
+    private clearObjectCullingIndex() {
+        this.objectCullingBuckets = new Map();
+        this.objectCullingFallbacks = [];
+        this.objectCullingVisible.clear();
+        this.objectCullingMaxRadius = 0;
+    }
+
+    private rebuildObjectCullingIndex() {
+        this.clearObjectCullingIndex();
+        if (!this.objectsGroup) return;
+
+        for (const child of this.objectsGroup.children) {
+            const { radius } = getTerrainObjectDrawRangeSphere(child, this.tempCullCenter, this.tempCullScale);
+            this.objectCullingMaxRadius = Math.max(this.objectCullingMaxRadius, radius);
+            child.visible = false;
+
+            const chunkKey = child.userData.terrainObjectChunkKey as string | undefined;
+            if (chunkKey) {
+                const bucket = this.objectCullingBuckets.get(chunkKey);
+                if (bucket) {
+                    bucket.push(child);
+                } else {
+                    this.objectCullingBuckets.set(chunkKey, [child]);
+                }
+                continue;
+            }
+
+            this.objectCullingFallbacks.push(child);
+        }
+    }
+
+    private collectObjectCullingCandidates(cameraPos: THREE.Vector3): Set<THREE.Object3D> {
+        const candidates = new Set<THREE.Object3D>(this.objectCullingFallbacks);
+        const range = this.objectDrawDistance + this.objectCullingMaxRadius;
+        const keys = getTerrainObjectCullingChunkKeys(
+            cameraPos.x,
+            cameraPos.z,
+            range,
+            TERRAIN_OBJECT_INSTANCE_CHUNK_WORLD_SIZE,
+        );
+
+        for (const key of keys) {
+            const bucket = this.objectCullingBuckets.get(key);
+            if (!bucket) continue;
+            for (const child of bucket) {
+                candidates.add(child);
+            }
+        }
+
+        for (const child of this.objectCullingVisible) {
+            candidates.add(child);
+        }
+
+        return candidates;
+    }
+
     private updateObjectDistanceCulling(force = false) {
         if (!this.objectsGroup || !this.objectsGroup.visible) return;
 
@@ -2039,8 +2226,12 @@ export class TerrainScene {
         }
 
         if (this.isolatedObjectRecord) {
+            this.objectCullingVisible.clear();
             for (const child of this.objectsGroup.children) {
                 child.visible = this.isChildVisibleForIsolatedRecord(child, this.isolatedObjectRecord);
+                if (child.visible) {
+                    this.objectCullingVisible.add(child);
+                }
             }
             this.objectCullLastUpdateMs = now;
             return;
@@ -2052,10 +2243,24 @@ export class TerrainScene {
 
         const maxDistance = this.objectDrawDistance;
         const cameraPos = this.camera.position;
-        for (const child of this.objectsGroup.children) {
-            child.visible = this.isWithinDrawRange(child, cameraPos, maxDistance);
+        const candidates = this.collectObjectCullingCandidates(cameraPos);
+        const nextVisible = new Set<THREE.Object3D>();
+
+        for (const child of candidates) {
+            const visible = this.isWithinDrawRange(child, cameraPos, maxDistance);
+            child.visible = visible;
+            if (visible) {
+                nextVisible.add(child);
+            }
         }
 
+        for (const child of this.objectCullingVisible) {
+            if (!nextVisible.has(child)) {
+                child.visible = false;
+            }
+        }
+
+        this.objectCullingVisible = nextVisible;
         this.objectCullLastUpdateMs = now;
     }
 
@@ -2071,12 +2276,17 @@ export class TerrainScene {
         const cameraPos = this.camera.position;
 
         for (const animatedInstance of this.animatedObjectInstances) {
-            // Direct .visible check — parent (objectsGroup) visibility is
-            // already guarded above, so no need to walk the hierarchy.
-            if (!animatedInstance.object3D.visible) continue;
-            if (animatedInstance.worldPosition.distanceToSquared(cameraPos) > animDistSq) continue;
+            const visible = animatedInstance.isVisible
+                ? animatedInstance.isVisible()
+                : animatedInstance.object3D.visible;
+            if (!visible) continue;
+            if (!animatedInstance.ignoreDistanceCulling && animatedInstance.worldPosition.distanceToSquared(cameraPos) > animDistSq) continue;
 
-            animatedInstance.mixer.update(deltaSeconds);
+            if (animatedInstance.update) {
+                animatedInstance.update(deltaSeconds);
+            } else {
+                animatedInstance.mixer?.update(deltaSeconds);
+            }
         }
     }
 
@@ -2088,37 +2298,7 @@ export class TerrainScene {
     }
 
     private isWithinDrawRange(object: THREE.Object3D, cameraPos: THREE.Vector3, maxDistance: number): boolean {
-        let center: THREE.Vector3;
-        let radius: number;
-
-        // Pre-computed world-space bounding sphere (animated clone Groups).
-        const precomputed = object.userData.cullBoundingSphere as THREE.Sphere | undefined;
-        if (precomputed) {
-            center = precomputed.center;
-            radius = precomputed.radius;
-        } else {
-            // InstancedMesh / regular Mesh with geometry.
-            const geometry = (object as THREE.Mesh).geometry as THREE.BufferGeometry | undefined;
-            if (geometry) {
-                if (!geometry.boundingSphere) geometry.computeBoundingSphere();
-                const sphere = geometry.boundingSphere;
-                if (sphere) {
-                    this.tempCullCenter.copy(sphere.center).applyMatrix4(object.matrixWorld);
-                    this.tempCullScale.setFromMatrixScale(object.matrixWorld);
-                    const radiusScale = Math.max(this.tempCullScale.x, this.tempCullScale.y, this.tempCullScale.z);
-                    center = this.tempCullCenter;
-                    radius = sphere.radius * radiusScale;
-                } else {
-                    object.getWorldPosition(this.tempCullCenter);
-                    center = this.tempCullCenter;
-                    radius = 0;
-                }
-            } else {
-                object.getWorldPosition(this.tempCullCenter);
-                center = this.tempCullCenter;
-                radius = 0;
-            }
-        }
+        const { center, radius } = getTerrainObjectDrawRangeSphere(object, this.tempCullCenter, this.tempCullScale);
 
         // Distance check.
         const maxRange = maxDistance + radius;

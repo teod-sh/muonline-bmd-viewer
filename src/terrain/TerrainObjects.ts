@@ -4,8 +4,20 @@ import { BMDLoader, convertTgaToDataUrl } from '../bmd-loader';
 import { convertOzjToDataUrl } from '../ozj-loader';
 import type { SelectedWorldObjectRef } from '../explorer-types';
 import { DEFAULT_ANIMATION_PLAYBACK_SPEED } from '../animation-settings';
+import {
+    bakeMeshGeometryToRootSpace,
+    updateBakedMeshGeometryToRootSpace,
+} from '../utils/SkinnedMeshBaker';
 import { createWorldObjectId } from './TerrainExplorerUtils';
-import { canUseInstancedStaticObjects } from './TerrainAnimationUtils';
+import {
+    getTerrainObjectInstanceChunkKey,
+    shouldChunkTerrainObjectInstances,
+    type TerrainAnimatedInstancingMode,
+} from './TerrainObjectInstancing';
+import {
+    canUseInstancedAnimatedObjects,
+    canUseInstancedStaticObjects,
+} from './TerrainAnimationUtils';
 import type { OBJData, MapObject } from './formats/OBJReader';
 import { TERRAIN_WORLD_SIZE } from './TerrainMesh';
 import {
@@ -38,10 +50,17 @@ export interface TerrainObjectLoadResult {
     animatedInstances: TerrainAnimatedObjectInstance[];
 }
 
+export interface TerrainObjectLoadOptions {
+    animatedInstancingMode?: TerrainAnimatedInstancingMode;
+}
+
 export interface TerrainAnimatedObjectInstance {
     object3D: THREE.Object3D;
-    mixer: THREE.AnimationMixer;
+    mixer: THREE.AnimationMixer | null;
     worldPosition: THREE.Vector3;
+    ignoreDistanceCulling?: boolean;
+    isVisible?: () => boolean;
+    update?: (deltaSeconds: number) => void;
 }
 
 // World 1 object type-to-name mapping.
@@ -178,14 +197,14 @@ const OBJECT_NAME_ALIASES: Record<string, string[]> = {
     shop01: ['ship01'],
 };
 
-const OBJECT_INSTANCE_CHUNK_WORLD_SIZE = 4096;
-const OBJECT_INSTANCE_CHUNK_THRESHOLD = 64;
+const OBJECT_ANIMATED_INSTANCE_THRESHOLD = 8;
 
 export async function loadTerrainObjects(
     objData: OBJData,
     files: Map<string, File>,
     mapNumber: number,
     onProgress?: (loaded: number, total: number) => void,
+    options: TerrainObjectLoadOptions = {},
 ): Promise<TerrainObjectLoadResult> {
     const group = new THREE.Group();
     group.name = 'terrain_objects';
@@ -198,6 +217,7 @@ export async function loadTerrainObjects(
     const blendCache = new Map<string, BlendHeuristicResult>();
     const records: TerrainObjectSelectionRecord[] = [];
     const animatedInstances: TerrainAnimatedObjectInstance[] = [];
+    const animatedInstancingMode = options.animatedInstancingMode ?? 'dynamic';
 
     // Group objects by type for instancing
     const byType = new Map<number, MapObject[]>();
@@ -238,16 +258,29 @@ export async function loadTerrainObjects(
                 await tryApplyTexture(template, texName, files, textureLoader, textureCache, blendCache);
             }
 
-            // Place instances. Prefer GPU instancing for static meshes.
-            const instanced = addInstancedStaticObjects(
-                group,
-                template,
-                instances,
-                baseOrientation,
-                definition,
-                approximateRadius,
-                records,
-            );
+            // Place instances. Prefer GPU instancing. Static skinned BMDs are
+            // baked once; repeated animated BMDs are baked once per frame/type.
+            const instanced = template.animations.length > 0
+                ? addInstancedAnimatedObjects(
+                    group,
+                    template,
+                    instances,
+                    baseOrientation,
+                    definition,
+                    approximateRadius,
+                    records,
+                    animatedInstances,
+                    animatedInstancingMode,
+                )
+                : addInstancedStaticObjects(
+                    group,
+                    template,
+                    instances,
+                    baseOrientation,
+                    definition,
+                    approximateRadius,
+                    records,
+                );
 
             if (!instanced) {
                 for (const inst of instances) {
@@ -533,62 +566,24 @@ function addInstancedStaticObjects(
     approximateRadius: number,
     records: TerrainObjectSelectionRecord[],
 ): boolean {
-    const templateMeshes: THREE.Mesh[] = [];
-    let hasSkinnedMeshes = false;
-    template.traverse(obj => {
-        const mesh = obj as THREE.Mesh;
-        if (!mesh.isMesh) return;
-        templateMeshes.push(mesh);
-        if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) {
-            hasSkinnedMeshes = true;
-        }
-    });
+    const templateInfo = collectTemplateMeshes(template);
 
     if (!canUseInstancedStaticObjects({
-        meshCount: templateMeshes.length,
-        hasSkinnedMeshes,
+        meshCount: templateInfo.meshes.length,
+        hasSkinnedMeshes: templateInfo.hasSkinnedMeshes,
         animationCount: template.animations.length,
     })) {
         return false;
     }
 
-    template.updateMatrixWorld(true);
-    const templateWorldInverse = new THREE.Matrix4().copy(template.matrixWorld).invert();
-
-    const useChunking = instances.length >= OBJECT_INSTANCE_CHUNK_THRESHOLD;
-    const chunkedItems = new Map<string, Array<{ instance: MapObject; matrix: THREE.Matrix4; record: TerrainObjectSelectionRecord }>>();
-    const position = new THREE.Vector3();
-    const scale = new THREE.Vector3();
-    for (let i = 0; i < instances.length; i++) {
-        const inst = instances[i];
-        position.copy(mapObjectToWorldPosition(inst));
-        const rotation = mapObjectAngleToQuaternion(inst.angle).multiply(baseOrientation);
-        scale.setScalar(inst.scale);
-        const objectMatrix = new THREE.Matrix4().compose(position, rotation, scale);
-        const chunkKey = useChunking
-            ? getObjectChunkKey(position.x, position.z)
-            : 'all';
-        const record = createSelectionRecord(
-            definition,
-            inst,
-            position,
-            approximateRadius,
-            null,
-            null,
-            null,
-        );
-        const chunk = chunkedItems.get(chunkKey);
-        const item = { instance: inst, matrix: objectMatrix, record };
-        if (chunk) {
-            chunk.push(item);
-        } else {
-            chunkedItems.set(chunkKey, [item]);
-        }
-    }
+    const useChunking = shouldChunkTerrainObjectInstances(instances.length);
+    const chunkedItems = createObjectInstanceChunks(instances, baseOrientation, definition, approximateRadius, useChunking);
 
     const meshLocalFromTemplate = new THREE.Matrix4();
     const finalMatrix = new THREE.Matrix4();
-    for (const srcMesh of templateMeshes) {
+    template.updateMatrixWorld(true);
+    const templateWorldInverse = new THREE.Matrix4().copy(template.matrixWorld).invert();
+    for (const srcMesh of templateInfo.meshes) {
         meshLocalFromTemplate
             .copy(templateWorldInverse)
             .multiply(srcMesh.matrixWorld);
@@ -601,6 +596,9 @@ function addInstancedStaticObjects(
             );
             const baseName = srcMesh.name || 'terrain_instanced_mesh';
             instancedMesh.name = `${baseName}_${chunkKey}`;
+            if (chunkKey !== 'all') {
+                instancedMesh.userData.terrainObjectChunkKey = chunkKey;
+            }
             instancedMesh.castShadow = srcMesh.castShadow;
             instancedMesh.receiveShadow = srcMesh.receiveShadow;
             instancedMesh.renderOrder = srcMesh.renderOrder;
@@ -629,10 +627,177 @@ function addInstancedStaticObjects(
     return true;
 }
 
-function getObjectChunkKey(worldX: number, worldZ: number): string {
-    const chunkX = Math.floor(worldX / OBJECT_INSTANCE_CHUNK_WORLD_SIZE);
-    const chunkZ = Math.floor(worldZ / OBJECT_INSTANCE_CHUNK_WORLD_SIZE);
-    return `${chunkX}:${chunkZ}`;
+function addInstancedAnimatedObjects(
+    target: THREE.Group,
+    template: THREE.Group,
+    instances: MapObject[],
+    baseOrientation: THREE.Quaternion,
+    definition: TerrainObjectDefinition,
+    approximateRadius: number,
+    records: TerrainObjectSelectionRecord[],
+    animatedInstances: TerrainAnimatedObjectInstance[],
+    animatedInstancingMode: TerrainAnimatedInstancingMode,
+): boolean {
+    const templateInfo = collectTemplateMeshes(template);
+    if (instances.length < OBJECT_ANIMATED_INSTANCE_THRESHOLD) {
+        return false;
+    }
+
+    if (!canUseInstancedAnimatedObjects({
+        meshCount: templateInfo.meshes.length,
+        hasSkinnedMeshes: templateInfo.hasSkinnedMeshes,
+        instanceCount: instances.length,
+        animationCount: template.animations.length,
+        canBakeAnimatedPose: true,
+    })) {
+        return false;
+    }
+
+    template.updateMatrixWorld(true);
+    const templateWorldInverse = new THREE.Matrix4().copy(template.matrixWorld).invert();
+    const clip = template.animations[0];
+    const mixer = new THREE.AnimationMixer(template);
+    const action = mixer.clipAction(clip);
+    action.setEffectiveTimeScale(DEFAULT_ANIMATION_PLAYBACK_SPEED);
+    action.reset().play();
+    mixer.update(0);
+    template.updateMatrixWorld(true);
+
+    const useChunking = shouldChunkTerrainObjectInstances(instances.length);
+    const chunkedItems = createObjectInstanceChunks(instances, baseOrientation, definition, approximateRadius, useChunking);
+    const animatedMeshes: Array<{ sourceMesh: THREE.Mesh; bakedGeometry: THREE.BufferGeometry }> = [];
+    const allInstancedMeshes: THREE.InstancedMesh[] = [];
+
+    for (const srcMesh of templateInfo.meshes) {
+        const bakedGeometry = bakeMeshGeometryToRootSpace(srcMesh, templateWorldInverse);
+        for (const [chunkKey, chunkItems] of chunkedItems) {
+            const instancedMesh = new THREE.InstancedMesh(
+                bakedGeometry,
+                srcMesh.material,
+                chunkItems.length,
+            );
+            const baseName = srcMesh.name || 'terrain_animated_instanced_mesh';
+            instancedMesh.name = `${baseName}_animated_${chunkKey}`;
+            if (chunkKey !== 'all') {
+                instancedMesh.userData.terrainObjectChunkKey = chunkKey;
+            }
+            instancedMesh.castShadow = srcMesh.castShadow;
+            instancedMesh.receiveShadow = srcMesh.receiveShadow;
+            instancedMesh.renderOrder = srcMesh.renderOrder;
+            instancedMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+            instancedMesh.matrixAutoUpdate = false;
+
+            const chunkRecords: TerrainObjectSelectionRecord[] = [];
+            for (let i = 0; i < chunkItems.length; i++) {
+                instancedMesh.setMatrixAt(i, chunkItems[i].matrix);
+                chunkItems[i].record.instancedMesh = instancedMesh;
+                chunkItems[i].record.instanceId = i;
+                chunkRecords.push(chunkItems[i].record);
+                records.push(chunkItems[i].record);
+            }
+
+            instancedMesh.userData.terrainObjectRecords = chunkRecords;
+            instancedMesh.instanceMatrix.needsUpdate = true;
+            instancedMesh.computeBoundingBox();
+            instancedMesh.computeBoundingSphere();
+            instancedMesh.updateMatrix();
+            target.add(instancedMesh);
+            allInstancedMeshes.push(instancedMesh);
+        }
+
+        animatedMeshes.push({ sourceMesh: srcMesh, bakedGeometry });
+    }
+
+    const update = animatedInstancingMode === 'dynamic'
+        ? (deltaSeconds: number) => {
+            mixer.update(deltaSeconds);
+            template.updateMatrixWorld(true);
+            templateWorldInverse.copy(template.matrixWorld).invert();
+            for (const animatedMesh of animatedMeshes) {
+                updateBakedMeshGeometryToRootSpace(
+                    animatedMesh.sourceMesh,
+                    templateWorldInverse,
+                    animatedMesh.bakedGeometry,
+                    false,
+                );
+            }
+        }
+        : undefined;
+
+    animatedInstances.push({
+        object3D: allInstancedMeshes[0] ?? template,
+        mixer: update ? mixer : null,
+        worldPosition: getAverageInstanceWorldPosition(instances),
+        ignoreDistanceCulling: true,
+        isVisible: () => allInstancedMeshes.some(mesh => mesh.visible),
+        update,
+    });
+
+    return true;
+}
+
+function collectTemplateMeshes(template: THREE.Object3D): { meshes: THREE.Mesh[]; hasSkinnedMeshes: boolean } {
+    const meshes: THREE.Mesh[] = [];
+    let hasSkinnedMeshes = false;
+    template.traverse(obj => {
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        meshes.push(mesh);
+        if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) {
+            hasSkinnedMeshes = true;
+        }
+    });
+    return { meshes, hasSkinnedMeshes };
+}
+
+function createObjectInstanceChunks(
+    instances: MapObject[],
+    baseOrientation: THREE.Quaternion,
+    definition: TerrainObjectDefinition,
+    approximateRadius: number,
+    useChunking: boolean,
+): Map<string, Array<{ instance: MapObject; matrix: THREE.Matrix4; record: TerrainObjectSelectionRecord }>> {
+    const chunkedItems = new Map<string, Array<{ instance: MapObject; matrix: THREE.Matrix4; record: TerrainObjectSelectionRecord }>>();
+    const position = new THREE.Vector3();
+    const scale = new THREE.Vector3();
+    for (const inst of instances) {
+        position.copy(mapObjectToWorldPosition(inst));
+        const rotation = mapObjectAngleToQuaternion(inst.angle).multiply(baseOrientation);
+        scale.setScalar(inst.scale);
+        const objectMatrix = new THREE.Matrix4().compose(position, rotation, scale);
+        const chunkKey = useChunking
+            ? getTerrainObjectInstanceChunkKey(position.x, position.z)
+            : 'all';
+        const record = createSelectionRecord(
+            definition,
+            inst,
+            position,
+            approximateRadius,
+            null,
+            null,
+            null,
+        );
+        const chunk = chunkedItems.get(chunkKey);
+        const item = { instance: inst, matrix: objectMatrix, record };
+        if (chunk) {
+            chunk.push(item);
+        } else {
+            chunkedItems.set(chunkKey, [item]);
+        }
+    }
+    return chunkedItems;
+}
+
+function getAverageInstanceWorldPosition(instances: MapObject[]): THREE.Vector3 {
+    const result = new THREE.Vector3();
+    if (instances.length === 0) {
+        return result;
+    }
+
+    for (const instance of instances) {
+        result.add(mapObjectToWorldPosition(instance));
+    }
+    return result.multiplyScalar(1 / instances.length);
 }
 
 async function tryApplyTexture(

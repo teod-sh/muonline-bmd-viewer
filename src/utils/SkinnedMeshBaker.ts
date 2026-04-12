@@ -64,16 +64,30 @@ function copyRootTransform(source: THREE.Group, target: THREE.Group): void {
     }
 }
 
-function bakeMeshGeometryToRootSpace(mesh: THREE.Mesh, rootWorldInverse: THREE.Matrix4): THREE.BufferGeometry {
+export function updateBakedMeshGeometryToRootSpace(
+    mesh: THREE.Mesh,
+    rootWorldInverse: THREE.Matrix4,
+    bakedGeometry: THREE.BufferGeometry,
+    recomputeBounds = true,
+): void {
     const sourceGeometry = mesh.geometry as THREE.BufferGeometry;
-    const bakedGeometry = sourceGeometry.clone();
     const positionAttribute = sourceGeometry.getAttribute('position');
     const normalAttribute = sourceGeometry.getAttribute('normal');
-    const bakedPositions = new Float32Array(positionAttribute.count * 3);
-    const bakedNormals = normalAttribute ? new Float32Array(normalAttribute.count * 3) : null;
+    let bakedPositionAttribute = bakedGeometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+    let bakedNormalAttribute = bakedGeometry.getAttribute('normal') as THREE.BufferAttribute | undefined;
     const skinnedMesh = (mesh as THREE.SkinnedMesh).isSkinnedMesh
         ? mesh as THREE.SkinnedMesh
         : null;
+
+    if (!bakedPositionAttribute || bakedPositionAttribute.count !== positionAttribute.count) {
+        bakedPositionAttribute = new THREE.Float32BufferAttribute(positionAttribute.count * 3, 3);
+        bakedGeometry.setAttribute('position', bakedPositionAttribute);
+    }
+
+    if (normalAttribute && (!bakedNormalAttribute || bakedNormalAttribute.count !== normalAttribute.count)) {
+        bakedNormalAttribute = new THREE.Float32BufferAttribute(normalAttribute.count * 3, 3);
+        bakedGeometry.setAttribute('normal', bakedNormalAttribute);
+    }
 
     objectToRootMatrix.multiplyMatrices(rootWorldInverse, mesh.matrixWorld);
     normalMatrix.getNormalMatrix(objectToRootMatrix);
@@ -90,11 +104,9 @@ function bakeMeshGeometryToRootSpace(mesh: THREE.Mesh, rootWorldInverse: THREE.M
         }
 
         tempPosition.applyMatrix4(objectToRootMatrix);
-        bakedPositions[i * 3] = tempPosition.x;
-        bakedPositions[i * 3 + 1] = tempPosition.y;
-        bakedPositions[i * 3 + 2] = tempPosition.z;
+        bakedPositionAttribute.setXYZ(i, tempPosition.x, tempPosition.y, tempPosition.z);
 
-        if (!normalAttribute || !bakedNormals) continue;
+        if (!normalAttribute || !bakedNormalAttribute) continue;
 
         tempNormal.fromBufferAttribute(normalAttribute, i);
 
@@ -103,23 +115,29 @@ function bakeMeshGeometryToRootSpace(mesh: THREE.Mesh, rootWorldInverse: THREE.M
         }
 
         tempNormal.applyMatrix3(normalMatrix).normalize();
-        bakedNormals[i * 3] = tempNormal.x;
-        bakedNormals[i * 3 + 1] = tempNormal.y;
-        bakedNormals[i * 3 + 2] = tempNormal.z;
+        bakedNormalAttribute.setXYZ(i, tempNormal.x, tempNormal.y, tempNormal.z);
     }
 
-    bakedGeometry.setAttribute('position', new THREE.Float32BufferAttribute(bakedPositions, 3));
-
-    if (bakedNormals) {
-        bakedGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(bakedNormals, 3));
+    bakedPositionAttribute.needsUpdate = true;
+    if (normalAttribute && bakedNormalAttribute) {
+        bakedNormalAttribute.needsUpdate = true;
     } else {
         bakedGeometry.computeVertexNormals();
     }
 
+    if (recomputeBounds) {
+        bakedGeometry.computeBoundingBox();
+        bakedGeometry.computeBoundingSphere();
+    }
+}
+
+export function bakeMeshGeometryToRootSpace(mesh: THREE.Mesh, rootWorldInverse: THREE.Matrix4): THREE.BufferGeometry {
+    const sourceGeometry = mesh.geometry as THREE.BufferGeometry;
+    const bakedGeometry = sourceGeometry.clone();
+
     bakedGeometry.deleteAttribute('skinIndex');
     bakedGeometry.deleteAttribute('skinWeight');
-    bakedGeometry.computeBoundingBox();
-    bakedGeometry.computeBoundingSphere();
+    updateBakedMeshGeometryToRootSpace(mesh, rootWorldInverse, bakedGeometry);
 
     return bakedGeometry;
 }
