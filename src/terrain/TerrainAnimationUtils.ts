@@ -12,6 +12,21 @@ export function canUseInstancedStaticObjects(eligibility: TerrainInstancingEligi
         && eligibility.animationCount === 0;
 }
 
+export interface TerrainAnimatedInstancingEligibility {
+    meshCount: number;
+    hasSkinnedMeshes: boolean;
+    instanceCount: number;
+    animationCount: number;
+    canBakeAnimatedPose: boolean;
+}
+
+export function canUseInstancedAnimatedObjects(eligibility: TerrainAnimatedInstancingEligibility): boolean {
+    return eligibility.meshCount > 0
+        && eligibility.instanceCount > 1
+        && eligibility.animationCount > 0
+        && eligibility.canBakeAnimatedPose;
+}
+
 export function isObjectVisibleInHierarchy(object: THREE.Object3D | null): boolean {
     if (!object) {
         return false;

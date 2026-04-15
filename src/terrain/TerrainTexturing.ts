@@ -1,6 +1,6 @@
 // src/terrain/TerrainTexturing.ts
 import * as THREE from 'three';
-import { TERRAIN_SIZE } from './formats/ATTReader';
+import { TERRAIN_SIZE, TWFlags, type TerrainAttributeData } from './formats/ATTReader';
 import type { TerrainMappingData } from './formats/MAPReader';
 
 // MU terrain samples use a 64x64 texel footprint per tile, regardless of source texture dimensions.
@@ -16,7 +16,7 @@ export interface TerrainAtlas {
     tileUvScale: number;
 }
 
-export type TerrainMaterialMode = 'shader' | 'baked';
+export type TerrainMaterialMode = 'shader' | 'baked' | 'atlas-geometry';
 const TERRAIN_BAKED_TEXTURE_SIZE = 4096;
 
 /**
@@ -306,6 +306,202 @@ export function createTerrainMaterial(
     });
 }
 
+export async function createTerrainAtlasGeometryMesh(
+    sourceGeometry: THREE.BufferGeometry,
+    attributes: TerrainAttributeData,
+    atlas: TerrainAtlas,
+    mapping: TerrainMappingData,
+    useLightmap: boolean,
+): Promise<THREE.Mesh> {
+    const baseGeometry = createTerrainAtlasLayerGeometry(sourceGeometry, attributes, atlas, mapping, 'layer1', useLightmap);
+    const baseMaterial = await createTerrainAtlasGeometryMaterial(atlas.texture, false);
+    const baseMesh = new THREE.Mesh(baseGeometry, baseMaterial);
+    baseMesh.name = 'terrain';
+    baseMesh.userData.minimapGeometry = sourceGeometry;
+    baseMesh.userData.tileCount = getVisibleTerrainTileCount(attributes);
+
+    const overlayGeometry = createTerrainAtlasLayerGeometry(sourceGeometry, attributes, atlas, mapping, 'layer2', useLightmap);
+    const overlayPosition = overlayGeometry.getAttribute('position');
+    if (overlayPosition && overlayPosition.count > 0) {
+        const overlayMaterial = await createTerrainAtlasGeometryMaterial(atlas.texture, true);
+        const overlayMesh = new THREE.Mesh(overlayGeometry, overlayMaterial);
+        overlayMesh.name = 'terrain_overlay';
+        overlayMesh.renderOrder = 1;
+        baseMesh.add(overlayMesh);
+    } else {
+        overlayGeometry.dispose();
+    }
+
+    return baseMesh;
+}
+
+async function createTerrainAtlasGeometryMaterial(map: THREE.Texture, transparent: boolean): Promise<THREE.MeshBasicMaterial> {
+    const material = new THREE.MeshBasicMaterial({
+        map,
+        side: THREE.FrontSide,
+        transparent,
+        depthWrite: !transparent,
+    });
+    material.toneMapped = false;
+
+    // The reference terrain shader multiplies texture and lightmap values in gamma/sRGB space.
+    // WebGPU node materials output linear working color, so feed linearized gamma-space output.
+    const { sRGBTransferEOTF, texture, uv, vec4, vertexColor } = await import('three/tsl');
+    const gammaColor = texture(map, uv()).mul(vertexColor());
+    (material as THREE.MeshBasicMaterial & { colorNode?: unknown }).colorNode = vec4(
+        sRGBTransferEOTF(gammaColor.rgb),
+        gammaColor.a,
+    );
+
+    return material;
+}
+
+function createTerrainAtlasLayerGeometry(
+    sourceGeometry: THREE.BufferGeometry,
+    attributes: TerrainAttributeData,
+    atlas: TerrainAtlas,
+    mapping: TerrainMappingData,
+    layer: 'layer1' | 'layer2',
+    useLightmap: boolean,
+): THREE.BufferGeometry {
+    const sourcePositions = sourceGeometry.getAttribute('position');
+    const sourceNormals = sourceGeometry.getAttribute('normal');
+    const sourceColors = sourceGeometry.getAttribute('color');
+    if (!sourcePositions || !sourceNormals || !sourceColors) {
+        throw new Error('Terrain atlas geometry requires position, normal, and color attributes.');
+    }
+
+    const maxTiles = TERRAIN_SIZE * TERRAIN_SIZE;
+    const positions = new Float32Array(maxTiles * 4 * 3);
+    const normals = new Float32Array(maxTiles * 4 * 3);
+    const uvs = new Float32Array(maxTiles * 4 * 2);
+    const colors = new Float32Array(maxTiles * 4 * 4);
+    const indices = new Uint32Array(maxTiles * 6);
+
+    const layerData = layer === 'layer1' ? mapping.layer1 : mapping.layer2;
+    let vertexOffset = 0;
+    let indexOffset = 0;
+
+    for (let ty = 0; ty < TERRAIN_SIZE; ty++) {
+        for (let tx = 0; tx < TERRAIN_SIZE; tx++) {
+            const tileIndex = ty * TERRAIN_SIZE + tx;
+            if (attributes.terrainWall[tileIndex] & TWFlags.NoGround) continue;
+
+            const textureIndex = layerData[tileIndex];
+            if (!isTerrainTextureIndexRenderable(textureIndex, atlas, layer)) continue;
+            if (layer === 'layer2' && !hasAnyOverlayAlpha(mapping, tx, ty)) continue;
+
+            const sourceVertexIndices = getTerrainTileSourceVertexIndices(tx, ty);
+            const alphaValues = layer === 'layer2'
+                ? getOverlayAlphaValues(mapping, tx, ty)
+                : [1, 1, 1, 1];
+            const atlasUvs = getTerrainTileAtlasUvs(atlas, textureIndex, tx, ty);
+
+            for (let corner = 0; corner < 4; corner++) {
+                const sourceVertexIndex = sourceVertexIndices[corner];
+                const dst3 = (vertexOffset + corner) * 3;
+                const dst2 = (vertexOffset + corner) * 2;
+                const dst4 = (vertexOffset + corner) * 4;
+
+                positions[dst3] = sourcePositions.getX(sourceVertexIndex);
+                positions[dst3 + 1] = sourcePositions.getY(sourceVertexIndex);
+                positions[dst3 + 2] = sourcePositions.getZ(sourceVertexIndex);
+
+                normals[dst3] = sourceNormals.getX(sourceVertexIndex);
+                normals[dst3 + 1] = sourceNormals.getY(sourceVertexIndex);
+                normals[dst3 + 2] = sourceNormals.getZ(sourceVertexIndex);
+
+                uvs[dst2] = atlasUvs[corner * 2];
+                uvs[dst2 + 1] = atlasUvs[corner * 2 + 1];
+
+                colors[dst4] = useLightmap ? sourceColors.getX(sourceVertexIndex) : 1;
+                colors[dst4 + 1] = useLightmap ? sourceColors.getY(sourceVertexIndex) : 1;
+                colors[dst4 + 2] = useLightmap ? sourceColors.getZ(sourceVertexIndex) : 1;
+                colors[dst4 + 3] = alphaValues[corner];
+            }
+
+            indices[indexOffset] = vertexOffset;
+            indices[indexOffset + 1] = vertexOffset + 1;
+            indices[indexOffset + 2] = vertexOffset + 3;
+            indices[indexOffset + 3] = vertexOffset + 1;
+            indices[indexOffset + 4] = vertexOffset + 2;
+            indices[indexOffset + 5] = vertexOffset + 3;
+
+            vertexOffset += 4;
+            indexOffset += 6;
+        }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(0, vertexOffset * 3), 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(normals.slice(0, vertexOffset * 3), 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs.slice(0, vertexOffset * 2), 2));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors.slice(0, vertexOffset * 4), 4));
+    geometry.setIndex(new THREE.BufferAttribute(indices.slice(0, indexOffset), 1));
+    return geometry;
+}
+
+function isTerrainTextureIndexRenderable(textureIndex: number, atlas: TerrainAtlas, layer: 'layer1' | 'layer2'): boolean {
+    if (layer === 'layer2' && textureIndex >= 255) return false;
+    return textureIndex >= 0 && textureIndex < atlas.count;
+}
+
+function hasAnyOverlayAlpha(mapping: TerrainMappingData, tx: number, ty: number): boolean {
+    const alpha = getOverlayAlphaValues(mapping, tx, ty);
+    return alpha.some(value => value > 0);
+}
+
+function getOverlayAlphaValues(mapping: TerrainMappingData, tx: number, ty: number): [number, number, number, number] {
+    return [
+        sampleMapIndex(mapping.alpha, tx, ty) / 255,
+        sampleMapIndex(mapping.alpha, tx + 1, ty) / 255,
+        sampleMapIndex(mapping.alpha, tx + 1, ty + 1) / 255,
+        sampleMapIndex(mapping.alpha, tx, ty + 1) / 255,
+    ];
+}
+
+function getVisibleTerrainTileCount(attributes: TerrainAttributeData): number {
+    let tileCount = 0;
+    for (let i = 0; i < attributes.terrainWall.length; i++) {
+        if (!(attributes.terrainWall[i] & TWFlags.NoGround)) tileCount++;
+    }
+    return tileCount;
+}
+
+function getTerrainTileSourceVertexIndices(tx: number, ty: number): [number, number, number, number] {
+    const vertexGridSize = TERRAIN_SIZE + 1;
+    const v0 = ty * vertexGridSize + tx;
+    const v1 = ty * vertexGridSize + tx + 1;
+    const v2 = (ty + 1) * vertexGridSize + tx + 1;
+    const v3 = (ty + 1) * vertexGridSize + tx;
+    return [v0, v1, v2, v3];
+}
+
+function getTerrainTileAtlasUvs(atlas: TerrainAtlas, textureIndex: number, tx: number, ty: number): number[] {
+    const col = textureIndex % atlas.cols;
+    const row = Math.floor(textureIndex / atlas.cols);
+    const inset = 0.5 / atlas.cellSize;
+    const x0 = getWrappedTileLocalUv(tx, 0, atlas.tileUvScale, inset);
+    const x1 = getWrappedTileLocalUv(tx, 1, atlas.tileUvScale, inset);
+    const y0 = getWrappedTileLocalUv(ty, 0, atlas.tileUvScale, inset);
+    const y1 = getWrappedTileLocalUv(ty, 1, atlas.tileUvScale, inset);
+
+    return [
+        (col + x0) / atlas.cols, (row + y0) / atlas.rows,
+        (col + x1) / atlas.cols, (row + y0) / atlas.rows,
+        (col + x1) / atlas.cols, (row + y1) / atlas.rows,
+        (col + x0) / atlas.cols, (row + y1) / atlas.rows,
+    ];
+}
+
+function getWrappedTileLocalUv(tileCoord: number, cornerOffset: 0 | 1, tileUvScale: number, inset: number): number {
+    const scaled = tileCoord * tileUvScale;
+    const tileStart = scaled - Math.floor(scaled);
+    const local = cornerOffset === 0 ? tileStart : tileStart + tileUvScale;
+    const wrapped = local >= 1 - 1e-6 ? 1 : local;
+    return Math.min(1 - inset, Math.max(inset, wrapped));
+}
+
 function clampIndex(value: number): number {
     return Math.min(TERRAIN_SIZE - 1, Math.max(0, value));
 }
@@ -367,7 +563,7 @@ function createTerrainBakedMaterial(
 ): THREE.Material {
     const atlasCanvas = atlas.texture.image as HTMLCanvasElement | OffscreenCanvas | undefined;
     if (!atlasCanvas || !('getContext' in atlasCanvas)) {
-        return new THREE.MeshLambertMaterial({
+        return new THREE.MeshBasicMaterial({
             color: 0x7c8b5b,
             vertexColors: useLightmap,
             side: THREE.FrontSide,
@@ -376,7 +572,7 @@ function createTerrainBakedMaterial(
 
     const atlasContext = atlasCanvas.getContext('2d', { willReadFrequently: true });
     if (!atlasContext) {
-        return new THREE.MeshLambertMaterial({
+        return new THREE.MeshBasicMaterial({
             color: 0x7c8b5b,
             vertexColors: useLightmap,
             side: THREE.FrontSide,
@@ -392,7 +588,7 @@ function createTerrainBakedMaterial(
     bakedCanvas.height = TERRAIN_BAKED_TEXTURE_SIZE;
     const bakedContext = bakedCanvas.getContext('2d');
     if (!bakedContext) {
-        return new THREE.MeshLambertMaterial({
+        return new THREE.MeshBasicMaterial({
             color: 0x7c8b5b,
             vertexColors: useLightmap,
             side: THREE.FrontSide,
@@ -461,12 +657,12 @@ function createTerrainBakedMaterial(
     bakedTexture.wrapS = THREE.ClampToEdgeWrapping;
     bakedTexture.wrapT = THREE.ClampToEdgeWrapping;
     bakedTexture.magFilter = THREE.LinearFilter;
-    bakedTexture.minFilter = THREE.LinearMipmapLinearFilter;
-    bakedTexture.generateMipmaps = true;
+    bakedTexture.minFilter = THREE.LinearFilter;
+    bakedTexture.generateMipmaps = false;
     bakedTexture.flipY = false;
     bakedTexture.needsUpdate = true;
 
-    return new THREE.MeshLambertMaterial({
+    return new THREE.MeshBasicMaterial({
         map: bakedTexture,
         vertexColors: useLightmap,
         side: THREE.FrontSide,

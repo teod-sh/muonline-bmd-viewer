@@ -1,4 +1,4 @@
-export type ViewerTab = 'bmd' | 'character' | 'terrain';
+export type ViewerTab = 'bmd' | 'character' | 'terrain' | 'att' | 'ozj' | 'items' | 'skills';
 
 export interface ExplorerVector3 {
   x: number;

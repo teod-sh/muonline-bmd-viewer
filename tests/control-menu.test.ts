@@ -20,6 +20,7 @@ describe('control menu state helpers', () => {
     expect(merged.sidebarCollapsed).toBe(true);
     expect(merged.sections['bmd-import-section']).toBe(false);
     expect(merged.sections['terrain-navigation-section']).toBe(true);
+    expect(merged.sections['terrain-attribute-section']).toBe(false);
     expect(merged.sections['character-profile-section']).toBe(true);
     expect(merged.sections['character-export-controls']).toBe(false);
     expect(Object.prototype.hasOwnProperty.call(merged.sections, 'unknown')).toBe(false);

@@ -14,6 +14,14 @@ export enum TWFlags {
     Action      = 0x0020,
     Height      = 0x0040,
     CameraUp    = 0x0080,
+    NoAttackZone = 0x0100,
+    Att1        = 0x0200,
+    Att2        = 0x0400,
+    Att3        = 0x0800,
+    Att4        = 0x1000,
+    Att5        = 0x2000,
+    Att6        = 0x4000,
+    Att7        = 0x8000,
 }
 
 export interface TerrainAttributeData {
@@ -21,7 +29,8 @@ export interface TerrainAttributeData {
     index: number;
     width: number;
     height: number;
-    terrainWall: Uint8Array; // 256*256, each byte is TWFlags
+    isExtended: boolean;
+    terrainWall: Uint16Array;
 }
 
 export function readATT(buffer: ArrayBuffer): TerrainAttributeData {
@@ -51,12 +60,19 @@ export function readATT(buffer: ArrayBuffer): TerrainAttributeData {
     const width = u8[2];
     const height = u8[3];
 
-    const terrainWall = new Uint8Array(TERRAIN_SIZE * TERRAIN_SIZE);
+    if (version !== 0) {
+        throw new Error(`ATT: unsupported version ${version}`);
+    }
+    if (width !== 255 || height !== 255) {
+        throw new Error(`ATT: invalid dimensions ${width}x${height}; expected 255x255`);
+    }
+
+    const terrainWall = new Uint16Array(TERRAIN_SIZE * TERRAIN_SIZE);
     let offset = 4;
 
     for (let i = 0; i < TERRAIN_SIZE * TERRAIN_SIZE; i++) {
         if (isExtended) {
-            terrainWall[i] = u8[offset] & 0xFF; // lower byte only
+            terrainWall[i] = u8[offset] | (u8[offset + 1] << 8);
             offset += 2;
         } else {
             terrainWall[i] = u8[offset];
@@ -64,5 +80,5 @@ export function readATT(buffer: ArrayBuffer): TerrainAttributeData {
         }
     }
 
-    return { version, index, width, height, terrainWall };
+    return { version, index, width, height, isExtended, terrainWall };
 }

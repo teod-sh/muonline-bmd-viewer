@@ -5,13 +5,19 @@ import { readMAP, type TerrainMappingData } from './formats/MAPReader';
 import { readOZB, type OZBData } from './formats/OZBReader';
 import { readOBJ, type OBJData } from './formats/OBJReader';
 import { buildTerrainGeometry, TERRAIN_SCALE } from './TerrainMesh';
-import { buildTextureAtlas, createTerrainMaterial, type TerrainMaterialMode } from './TerrainTexturing';
+import {
+    buildTextureAtlas,
+    createTerrainAtlasGeometryMesh,
+    createTerrainMaterial,
+    type TerrainMaterialMode,
+} from './TerrainTexturing';
 import { convertOzjToDataUrl } from '../ozj-loader';
 
 export interface TerrainResult {
     mesh: THREE.Mesh;
     objectsData: OBJData | null;
     mapNumber: number;
+    terrainAttributeData: TerrainAttributeData;
 }
 
 // Default terrain texture filenames — matches Client.Main TerrainData.GetDefaultTextureMappings().
@@ -87,16 +93,22 @@ export class TerrainLoader {
         // Build geometry
         const geometry = buildTerrainGeometry(heightData, attData, lightData);
 
-        // Build material
-        const material = createTerrainMaterial(atlas, mapData, !!lightData, materialMode);
+        const mesh = materialMode === 'atlas-geometry'
+            ? await createTerrainAtlasGeometryMesh(geometry, attData, atlas, mapData, !!lightData)
+            : new THREE.Mesh(geometry, createTerrainMaterial(atlas, mapData, !!lightData, materialMode));
+
         if (materialMode === 'baked') {
             atlas.texture.dispose();
         }
 
-        const mesh = new THREE.Mesh(geometry, material);
         mesh.name = 'terrain';
 
-        return { mesh, objectsData: objData, mapNumber: mapData.mapNumber };
+        return {
+            mesh,
+            objectsData: objData,
+            mapNumber: mapData.mapNumber,
+            terrainAttributeData: attData,
+        };
     }
 
     // ── Diagnostic helpers ──

@@ -1,6 +1,5 @@
 // src/terrain-scene.ts
 import * as THREE from 'three';
-import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { ExplorerBookmark, ExplorerVector3, SelectedWorldObjectRef, TerrainSessionState } from './explorer-types';
 import { createId } from './explorer-store';
@@ -11,12 +10,28 @@ import {
     type TerrainObjectLoadResult,
     type TerrainObjectSelectionRecord,
 } from './terrain/TerrainObjects';
+import {
+    TerrainObjectCullingIndex,
+    getTerrainObjectDrawRangeSphere,
+} from './terrain/TerrainObjectCulling';
+import {
+    getTerrainAnimatedInstancingModeForBackend,
+    TERRAIN_OBJECT_INSTANCE_CHUNK_WORLD_SIZE,
+} from './terrain/TerrainObjectInstancing';
+import { collectTerrainObjectWarmupTextures } from './terrain/TerrainObjectWarmup';
 import { updateTerrainObjectSelectionBox } from './terrain/TerrainObjectSelectionBounds';
 import {
     buildHeightMinimapRaster,
     minimapPointToWorld,
     worldToMinimapPoint,
 } from './terrain/TerrainExplorerUtils';
+import {
+    TERRAIN_ATTRIBUTE_FLAG_DEFINITIONS,
+    formatTerrainAttributeFlagHex,
+    summarizeTerrainAttributeData,
+    type TerrainAttributeFlagSummary,
+    type TerrainAttributeSummary,
+} from './terrain/TerrainAttributeSummary';
 import { TERRAIN_SCALE, TERRAIN_WORLD_SIZE } from './terrain/TerrainMesh';
 import { TERRAIN_SIZE } from './terrain/formats/ATTReader';
 import {
@@ -40,6 +55,13 @@ import {
     upsertTerrainObjectTransformOverride,
     upsertTerrainObjectTypeOverride,
 } from './terrain/TerrainObjectOverrides';
+import {
+    createPreferredRenderer,
+    getActiveRendererBackend,
+    isWebGLRenderer,
+    type RendererBackendActive as SharedRendererBackendActive,
+    type SupportedRenderer,
+} from './rendering/RendererBackend';
 
 const TERRAIN_BASE_AMBIENT_INTENSITY = 0.6;
 const TERRAIN_BASE_SUN_INTENSITY = 1.0;
@@ -51,13 +73,17 @@ const TERRAIN_OBJECT_CULL_INTERVAL_MS = 120;
 const TERRAIN_CAMERA_MOVE_SPEED = 7000;
 const TERRAIN_CAMERA_SPRINT_MULTIPLIER = 2.2;
 const TERRAIN_MAX_DELTA_SECONDS = 0.1;
-type SupportedRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
 type TerrainRendererBackendPreference = TerrainSessionState['rendererBackend'];
-type TerrainRendererBackendActive = 'webgpu' | 'webgl';
+type TerrainRendererBackendActive = SharedRendererBackendActive;
 type TerrainMaterialBinding = {
     key: string;
     label: string;
     materials: THREE.Material[];
+};
+type TerrainObjectWarmupRenderer = SupportedRenderer & {
+    initTexture?: (texture: THREE.Texture) => void;
+    compile?: (scene: THREE.Object3D, camera: THREE.Camera, targetScene?: THREE.Scene | null) => unknown;
+    compileAsync?: (scene: THREE.Object3D, camera: THREE.Camera, targetScene?: THREE.Scene | null) => Promise<unknown>;
 };
 
 const TERRAIN_OBJECT_BLEND_MODE_TO_THREE: Record<TerrainObjectBlendModeName, THREE.Blending> = {
@@ -84,6 +110,7 @@ export class TerrainScene {
     public onBookmarkCreated?: (bookmark: ExplorerBookmark) => void;
     public onOpenModelRequest?: (selection: SelectedWorldObjectRef, modelFile: File | null) => void;
     public onStateChanged?: (state: TerrainSessionState) => void;
+    public onAttDataChanged?: (data: import('./terrain/formats/ATTReader').TerrainAttributeData | null, worldNumber: number | null) => void;
 
     private scene!: THREE.Scene;
     private camera!: THREE.PerspectiveCamera;
@@ -100,6 +127,7 @@ export class TerrainScene {
     private sunLight: THREE.DirectionalLight | null = null;
     private objectDrawDistance = TERRAIN_OBJECT_DRAW_DISTANCE_DEFAULT;
     private objectCullLastUpdateMs = 0;
+    private readonly objectCullingIndex = new TerrainObjectCullingIndex();
     private readonly tempCullCenter = new THREE.Vector3();
     private readonly tempCullScale = new THREE.Vector3();
     private readonly frustum = new THREE.Frustum();
@@ -139,6 +167,7 @@ export class TerrainScene {
     private pendingRestoreState: TerrainSessionState | null = null;
     private availableWorldNumbers: number[] = [];
     private loadedWorldNumber: number | null = null;
+    private loadedAttData: import('./terrain/formats/ATTReader').TerrainAttributeData | null = null;
     private currentWorldFiles = new Map<string, File>();
     private cameraChangeHandle: number | null = null;
     private animationsEnabled = true;
@@ -190,6 +219,14 @@ export class TerrainScene {
     private lastContextEl: HTMLElement | null = null;
     private tileCountEl: HTMLElement | null = null;
     private objectCountEl: HTMLElement | null = null;
+    private terrainAttributeStatusEl: HTMLElement | null = null;
+    private terrainAttributeVersionEl: HTMLElement | null = null;
+    private terrainAttributeIndexEl: HTMLElement | null = null;
+    private terrainAttributeDimensionsEl: HTMLElement | null = null;
+    private terrainAttributeFormatEl: HTMLElement | null = null;
+    private terrainAttributeTilesEl: HTMLElement | null = null;
+    private terrainAttributeOccupiedEl: HTMLElement | null = null;
+    private terrainAttributeLegendEl: HTMLElement | null = null;
     private objectOverrides: TerrainObjectOverridesFile = createEmptyTerrainObjectOverrides();
     private objectOverridesPath: string | null = null;
 
@@ -215,6 +252,10 @@ export class TerrainScene {
         this.presentationMode = enabled;
         this.updateSelectionMarker();
         this.minimapNeedsRedraw = true;
+    }
+
+    public getLoadedAttData(): import('./terrain/formats/ATTReader').TerrainAttributeData | null {
+        return this.loadedAttData;
     }
 
     public setStatusMessage(message: string) {
@@ -373,12 +414,8 @@ export class TerrainScene {
         return renderer;
     }
 
-    private createPreferredRenderer(preference: TerrainRendererBackendPreference): SupportedRenderer {
-        if (preference === 'webgl') {
-            return this.createClassicWebGLRenderer();
-        }
-
-        return new WebGPURenderer({
+    private createPreferredRenderer(preference: TerrainRendererBackendPreference): Promise<SupportedRenderer> {
+        return createPreferredRenderer(preference, () => this.createClassicWebGLRenderer(), {
             antialias: false,
         });
     }
@@ -429,11 +466,7 @@ export class TerrainScene {
     }
 
     private getActiveRendererBackend(renderer: SupportedRenderer): TerrainRendererBackendActive {
-        if (renderer instanceof THREE.WebGLRenderer) {
-            return 'webgl';
-        }
-
-        return (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? 'webgpu' : 'webgl';
+        return getActiveRendererBackend(renderer);
     }
 
     private updateRendererStatus(message?: string) {
@@ -457,8 +490,7 @@ export class TerrainScene {
     private clearWorldScene() {
         if (this.terrainMesh) {
             this.scene.remove(this.terrainMesh);
-            this.terrainMesh.geometry.dispose();
-            (this.terrainMesh.material as THREE.Material).dispose();
+            this.disposeTerrainObject(this.terrainMesh);
             this.terrainMesh = null;
         }
         if (this.objectsGroup) {
@@ -471,6 +503,7 @@ export class TerrainScene {
         this.isolatedObjectRecord = null;
         this.minimapSourceCanvas = null;
         this.minimapNeedsRedraw = true;
+        this.updateTerrainAttributePanel(null);
         this.updateObjectInspector();
         this.updateSelectionMarker();
         this.updateStats(0, 0);
@@ -513,11 +546,11 @@ export class TerrainScene {
             this.clearWorldScene();
         }
 
-        let renderer = this.createPreferredRenderer(preference);
+        let renderer = await this.createPreferredRenderer(preference);
         this.configureRenderer(renderer);
         let fallbackReason: string | null = null;
 
-        if (!(renderer instanceof THREE.WebGLRenderer)) {
+        if (!isWebGLRenderer(renderer)) {
             try {
                 await renderer.init();
             } catch (error) {
@@ -682,6 +715,15 @@ export class TerrainScene {
         this.lastContextEl = document.getElementById('terrain-last-context');
         this.tileCountEl = document.getElementById('terrain-tile-count');
         this.objectCountEl = document.getElementById('terrain-object-count');
+        this.terrainAttributeStatusEl = document.getElementById('terrain-attribute-status');
+        this.terrainAttributeVersionEl = document.getElementById('terrain-attribute-version');
+        this.terrainAttributeIndexEl = document.getElementById('terrain-attribute-index');
+        this.terrainAttributeDimensionsEl = document.getElementById('terrain-attribute-dimensions');
+        this.terrainAttributeFormatEl = document.getElementById('terrain-attribute-format');
+        this.terrainAttributeTilesEl = document.getElementById('terrain-attribute-tiles');
+        this.terrainAttributeOccupiedEl = document.getElementById('terrain-attribute-occupied');
+        this.terrainAttributeLegendEl = document.getElementById('terrain-attribute-legend');
+        this.updateTerrainAttributePanel(null);
 
         if (dropZone && folderInput) {
             dropZone.addEventListener('click', () => {
@@ -730,11 +772,13 @@ export class TerrainScene {
 
         this.wireframeEl?.addEventListener('change', () => {
             if (this.terrainMesh) {
-                const material = this.terrainMesh.material as THREE.Material & { wireframe?: boolean };
-                if ('wireframe' in material) {
-                    material.wireframe = this.wireframeEl?.checked ?? false;
-                    material.needsUpdate = true;
-                }
+                this.forEachTerrainMaterial(this.terrainMesh, material => {
+                    const terrainMaterial = material as THREE.Material & { wireframe?: boolean };
+                    if ('wireframe' in terrainMaterial) {
+                        terrainMaterial.wireframe = this.wireframeEl?.checked ?? false;
+                        terrainMaterial.needsUpdate = true;
+                    }
+                });
             }
             this.emitStateChanged();
         });
@@ -956,7 +1000,7 @@ export class TerrainScene {
             this.worldSelectEl.appendChild(opt);
         }
 
-        container.style.display = '';
+        container.classList.remove('initially-hidden');
     }
 
     /** Load a specific world by number */
@@ -1005,16 +1049,16 @@ export class TerrainScene {
 
         try {
             const result = await this.terrainLoader.load(files, {
-                materialMode: this.rendererActiveBackend === 'webgpu' ? 'baked' : 'shader',
+                materialMode: this.rendererActiveBackend === 'webgpu' ? 'atlas-geometry' : 'shader',
             });
 
             if (this.terrainMesh) {
                 this.scene.remove(this.terrainMesh);
-                this.terrainMesh.geometry.dispose();
-                (this.terrainMesh.material as THREE.Material).dispose();
+                this.disposeTerrainObject(this.terrainMesh);
             }
             if (this.objectsGroup) {
                 this.scene.remove(this.objectsGroup);
+                this.clearObjectCullingIndex();
             }
 
             this.terrainMesh = result.mesh;
@@ -1022,6 +1066,9 @@ export class TerrainScene {
             this.applyTerrainTextureQuality();
             this.updateStats(this.getTerrainTileCount(result.mesh), result.objectsData?.objects.length ?? 0);
             this.loadedWorldNumber = result.mapNumber;
+            this.loadedAttData = result.terrainAttributeData;
+            this.updateTerrainAttributePanel(summarizeTerrainAttributeData(result.terrainAttributeData));
+            this.onAttDataChanged?.(result.terrainAttributeData, result.mapNumber);
 
             const worldCenter = (TERRAIN_SIZE * TERRAIN_SCALE) / 2;
             this.controls.target.set(worldCenter, 0, worldCenter);
@@ -1037,12 +1084,18 @@ export class TerrainScene {
                     (loaded, total) => {
                         if (this.statusEl) this.statusEl.textContent = `Loading objects: ${loaded}/${total}...`;
                     },
+                    {
+                        animatedInstancingMode: getTerrainAnimatedInstancingModeForBackend(this.rendererActiveBackend),
+                    },
                 );
                 this.objectsGroup = objectResult.group;
                 this.objectRecords = objectResult.records;
                 this.animatedObjectInstances = objectResult.animatedInstances;
                 this.scene.add(this.objectsGroup);
                 this.applyPersistedObjectTypeOverridesForWorld(result.mapNumber);
+                this.rebuildObjectCullingIndex();
+                await this.prewarmTerrainObjectResources(this.objectsGroup);
+                void this.prewarmTerrainObjectResourcesBackground(this.objectsGroup);
 
                 if (this.showObjectsEl && this.objectsGroup) {
                     this.objectsGroup.visible = this.showObjectsEl.checked;
@@ -1109,7 +1162,8 @@ export class TerrainScene {
             return;
         }
 
-        const geometry = this.terrainMesh.geometry as THREE.BufferGeometry;
+        const geometry = (this.terrainMesh.userData.minimapGeometry as THREE.BufferGeometry | undefined)
+            ?? (this.terrainMesh.geometry as THREE.BufferGeometry);
         const positions = geometry.getAttribute('position');
         if (!positions) {
             this.minimapSourceCanvas = null;
@@ -1447,6 +1501,8 @@ export class TerrainScene {
             instancedMesh.computeBoundingBox();
             instancedMesh.computeBoundingSphere();
         }
+        this.rebuildObjectCullingIndex();
+        this.updateObjectDistanceCulling(true);
     }
 
     private ensureObjectRecordDefaultTransform(record: TerrainObjectSelectionRecord) {
@@ -1968,6 +2024,10 @@ export class TerrainScene {
 
     private getTerrainTileCount(mesh: THREE.Mesh): number {
         const geometry = mesh.geometry as THREE.BufferGeometry;
+        const tileCount = mesh.userData.tileCount;
+        if (typeof tileCount === 'number') {
+            return tileCount;
+        }
         const indexCount = geometry.getIndex()?.count ?? 0;
         if (indexCount > 0) {
             return Math.floor(indexCount / 6);
@@ -1976,9 +2036,250 @@ export class TerrainScene {
         return Math.floor(positionCount / 4);
     }
 
+    private forEachTerrainMaterial(root: THREE.Object3D, callback: (material: THREE.Material) => void) {
+        root.traverse(object => {
+            const material = (object as THREE.Mesh).material;
+            if (Array.isArray(material)) {
+                material.forEach(callback);
+            } else if (material instanceof THREE.Material) {
+                callback(material);
+            }
+        });
+    }
+
+    private disposeTerrainObject(root: THREE.Object3D) {
+        const disposedMaterials = new Set<THREE.Material>();
+        const disposedTextures = new Set<THREE.Texture>();
+        const minimapGeometry = root.userData.minimapGeometry;
+        if (minimapGeometry instanceof THREE.BufferGeometry) {
+            minimapGeometry.dispose();
+        }
+        root.traverse(object => {
+            const geometry = (object as THREE.Mesh).geometry;
+            if (geometry instanceof THREE.BufferGeometry) {
+                geometry.dispose();
+            }
+
+            const material = (object as THREE.Mesh).material;
+            const materials = Array.isArray(material)
+                ? material
+                : material instanceof THREE.Material
+                    ? [material]
+                    : [];
+            for (const item of materials) {
+                const map = (item as THREE.Material & { map?: THREE.Texture | null }).map;
+                if (map instanceof THREE.Texture && !disposedTextures.has(map)) {
+                    map.dispose();
+                    disposedTextures.add(map);
+                }
+                if (!disposedMaterials.has(item)) {
+                    item.dispose();
+                    disposedMaterials.add(item);
+                }
+            }
+        });
+    }
+
     private updateStats(tileCount: number, objectCount: number) {
         if (this.tileCountEl) this.tileCountEl.textContent = Math.max(0, tileCount).toLocaleString();
         if (this.objectCountEl) this.objectCountEl.textContent = Math.max(0, objectCount).toLocaleString();
+    }
+
+    private updateTerrainAttributePanel(summary: TerrainAttributeSummary | null) {
+        if (this.terrainAttributeStatusEl) {
+            this.terrainAttributeStatusEl.textContent = summary
+                ? `ATT loaded for World ${this.loadedWorldNumber ?? '-'}`
+                : 'Load a world to inspect ATT metadata.';
+        }
+        if (this.terrainAttributeVersionEl) {
+            this.terrainAttributeVersionEl.textContent = summary ? `${summary.version}` : '-';
+        }
+        if (this.terrainAttributeIndexEl) {
+            this.terrainAttributeIndexEl.textContent = summary ? `${summary.index}` : '-';
+        }
+        if (this.terrainAttributeDimensionsEl) {
+            this.terrainAttributeDimensionsEl.textContent = summary
+                ? `${summary.width} × ${summary.height}`
+                : '-';
+        }
+        if (this.terrainAttributeFormatEl) {
+            this.terrainAttributeFormatEl.textContent = summary ? summary.formatLabel : '-';
+        }
+        if (this.terrainAttributeTilesEl) {
+            this.terrainAttributeTilesEl.textContent = summary
+                ? summary.tileCount.toLocaleString()
+                : '-';
+        }
+        if (this.terrainAttributeOccupiedEl) {
+            this.terrainAttributeOccupiedEl.textContent = summary
+                ? summary.occupiedTileCount.toLocaleString()
+                : '-';
+        }
+        this.renderTerrainAttributeLegend(summary?.flags ?? null);
+    }
+
+    private renderTerrainAttributeLegend(flags: TerrainAttributeFlagSummary[] | null) {
+        if (!this.terrainAttributeLegendEl) {
+            return;
+        }
+
+        const entries = flags ?? TERRAIN_ATTRIBUTE_FLAG_DEFINITIONS.map(definition => ({
+            ...definition,
+            count: 0,
+            active: false,
+        }));
+
+        this.terrainAttributeLegendEl.replaceChildren(
+            ...entries.map(entry => {
+                const chip = document.createElement('div');
+                chip.className = 'terrain-attribute-flag';
+                if (!entry.active) {
+                    chip.classList.add('terrain-attribute-flag--inactive');
+                }
+
+                const topRow = document.createElement('div');
+                topRow.className = 'terrain-attribute-flag-top';
+
+                const name = document.createElement('span');
+                name.className = 'terrain-attribute-flag-name';
+                name.textContent = entry.name;
+
+                const count = document.createElement('span');
+                count.className = 'terrain-attribute-flag-count';
+                count.textContent = `${entry.count.toLocaleString()} tiles`;
+
+                topRow.append(name, count);
+
+                const code = document.createElement('span');
+                code.className = 'terrain-attribute-flag-code';
+                code.textContent = formatTerrainAttributeFlagHex(entry.flag);
+
+                chip.append(topRow, code);
+                return chip;
+            }),
+        );
+    }
+
+    private async prewarmTerrainObjectResources(root: THREE.Object3D) {
+        if (!this.renderer || !this.camera || !this.scene) return;
+
+        const renderer = this.renderer as TerrainObjectWarmupRenderer;
+
+        for (const texture of collectTerrainObjectWarmupTextures(root)) {
+            renderer.initTexture?.(texture);
+        }
+
+        if (!renderer.compileAsync) {
+            try {
+                renderer.compile?.(root, this.camera, this.scene);
+            } catch (error) {
+                console.warn('Terrain object resource pre-warm failed:', error);
+            }
+            return;
+        }
+
+        // Phase 1: compile what is currently in the camera frustum. This is the
+        // pre-fix behavior — fast, and ensures the renderer is initialized so
+        // phase 2's sync-trick is safe to rely on.
+        try {
+            await renderer.compileAsync(root, this.camera, this.scene);
+        } catch (error) {
+            console.warn('Terrain object resource pre-warm (visible pass) failed:', error);
+        }
+    }
+
+    private async prewarmTerrainObjectResourcesBackground(root: THREE.Object3D) {
+        if (!this.renderer || !this.camera || !this.scene) return;
+
+        const renderer = this.renderer as TerrainObjectWarmupRenderer;
+        if (!renderer.compileAsync) return;
+
+        // Phase 2: background compile of objects outside the camera frustum.
+        // WebGPU's compileAsync respects frustumCulled inside _projectObject, so
+        // anything off-screen at load time would otherwise compile on demand
+        // when the distance culler first reveals it — a visible hitch.
+        //
+        // We walk the object group one child at a time and rely on the fact
+        // that compileAsync is synchronous up to its final `await
+        // Promise.all(compilationPromises)` (see three/src/renderers/common/
+        // Renderer.js). That lets us force visible=true / frustumCulled=false
+        // only for the window where compileAsync builds the render list, then
+        // restore the flags before any await yields control. Render ticks that
+        // run between children therefore never observe forced-visible objects,
+        // so nothing flashes on screen.
+        //
+        // Between children we budget a few ms of work and then yield on rAF so
+        // the main thread stays responsive through the whole background pass.
+        const children = [...root.children];
+        const frameBudgetMs = 4;
+        let budgetStart =
+            typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+        for (const child of children) {
+            if (root !== this.objectsGroup) return; // world changed, cancel
+
+            const meshOverrides: THREE.Object3D[] = [];
+            const savedVisible = child.visible;
+            child.visible = true;
+            child.traverse(object => {
+                if (!(object as THREE.Mesh).isMesh) return;
+                if (!object.frustumCulled) return;
+                object.frustumCulled = false;
+                meshOverrides.push(object);
+            });
+
+            let compilePromise: Promise<unknown> | undefined;
+            try {
+                compilePromise = renderer.compileAsync(child, this.camera, this.scene);
+            } catch (error) {
+                console.warn('Terrain object resource pre-warm (background) failed:', error);
+            }
+
+            child.visible = savedVisible;
+            for (const mesh of meshOverrides) {
+                mesh.frustumCulled = true;
+            }
+
+            if (compilePromise) {
+                try {
+                    await compilePromise;
+                } catch (error) {
+                    console.warn('Terrain object resource pre-warm (background) compile rejected:', error);
+                }
+            }
+
+            const nowMs =
+                typeof performance !== 'undefined' ? performance.now() : Date.now();
+            if (nowMs - budgetStart > frameBudgetMs) {
+                await new Promise<void>(resolve => {
+                    if (typeof requestAnimationFrame === 'function') {
+                        requestAnimationFrame(() => resolve());
+                    } else {
+                        setTimeout(resolve, 0);
+                    }
+                });
+                budgetStart =
+                    typeof performance !== 'undefined' ? performance.now() : Date.now();
+            }
+        }
+    }
+
+    private clearObjectCullingIndex() {
+        this.objectCullingIndex.clear();
+    }
+
+    private rebuildObjectCullingIndex() {
+        this.clearObjectCullingIndex();
+        if (!this.objectsGroup) return;
+        this.objectCullingIndex.rebuild(this.objectsGroup.children);
+    }
+
+    private collectObjectCullingCandidates(cameraPos: THREE.Vector3): Set<THREE.Object3D> {
+        return this.objectCullingIndex.collectCandidates(
+            cameraPos,
+            this.objectDrawDistance,
+            TERRAIN_OBJECT_INSTANCE_CHUNK_WORLD_SIZE,
+        );
     }
 
     private updateObjectDistanceCulling(force = false) {
@@ -1990,8 +2291,12 @@ export class TerrainScene {
         }
 
         if (this.isolatedObjectRecord) {
+            this.objectCullingIndex.clearVisible();
             for (const child of this.objectsGroup.children) {
                 child.visible = this.isChildVisibleForIsolatedRecord(child, this.isolatedObjectRecord);
+                if (child.visible) {
+                    this.objectCullingIndex.addVisible(child);
+                }
             }
             this.objectCullLastUpdateMs = now;
             return;
@@ -2003,10 +2308,24 @@ export class TerrainScene {
 
         const maxDistance = this.objectDrawDistance;
         const cameraPos = this.camera.position;
-        for (const child of this.objectsGroup.children) {
-            child.visible = this.isWithinDrawRange(child, cameraPos, maxDistance);
+        const candidates = this.collectObjectCullingCandidates(cameraPos);
+        const nextVisible = new Set<THREE.Object3D>();
+
+        for (const child of candidates) {
+            const visible = this.isWithinDrawRange(child, cameraPos, maxDistance);
+            child.visible = visible;
+            if (visible) {
+                nextVisible.add(child);
+            }
         }
 
+        this.objectCullingIndex.forEachVisible(child => {
+            if (!nextVisible.has(child)) {
+                child.visible = false;
+            }
+        });
+
+        this.objectCullingIndex.replaceVisible(nextVisible);
         this.objectCullLastUpdateMs = now;
     }
 
@@ -2022,12 +2341,17 @@ export class TerrainScene {
         const cameraPos = this.camera.position;
 
         for (const animatedInstance of this.animatedObjectInstances) {
-            // Direct .visible check — parent (objectsGroup) visibility is
-            // already guarded above, so no need to walk the hierarchy.
-            if (!animatedInstance.object3D.visible) continue;
-            if (animatedInstance.worldPosition.distanceToSquared(cameraPos) > animDistSq) continue;
+            const visible = animatedInstance.isVisible
+                ? animatedInstance.isVisible()
+                : animatedInstance.object3D.visible;
+            if (!visible) continue;
+            if (!animatedInstance.ignoreDistanceCulling && animatedInstance.worldPosition.distanceToSquared(cameraPos) > animDistSq) continue;
 
-            animatedInstance.mixer.update(deltaSeconds);
+            if (animatedInstance.update) {
+                animatedInstance.update(deltaSeconds);
+            } else {
+                animatedInstance.mixer?.update(deltaSeconds);
+            }
         }
     }
 
@@ -2039,37 +2363,7 @@ export class TerrainScene {
     }
 
     private isWithinDrawRange(object: THREE.Object3D, cameraPos: THREE.Vector3, maxDistance: number): boolean {
-        let center: THREE.Vector3;
-        let radius: number;
-
-        // Pre-computed world-space bounding sphere (animated clone Groups).
-        const precomputed = object.userData.cullBoundingSphere as THREE.Sphere | undefined;
-        if (precomputed) {
-            center = precomputed.center;
-            radius = precomputed.radius;
-        } else {
-            // InstancedMesh / regular Mesh with geometry.
-            const geometry = (object as THREE.Mesh).geometry as THREE.BufferGeometry | undefined;
-            if (geometry) {
-                if (!geometry.boundingSphere) geometry.computeBoundingSphere();
-                const sphere = geometry.boundingSphere;
-                if (sphere) {
-                    this.tempCullCenter.copy(sphere.center).applyMatrix4(object.matrixWorld);
-                    this.tempCullScale.setFromMatrixScale(object.matrixWorld);
-                    const radiusScale = Math.max(this.tempCullScale.x, this.tempCullScale.y, this.tempCullScale.z);
-                    center = this.tempCullCenter;
-                    radius = sphere.radius * radiusScale;
-                } else {
-                    object.getWorldPosition(this.tempCullCenter);
-                    center = this.tempCullCenter;
-                    radius = 0;
-                }
-            } else {
-                object.getWorldPosition(this.tempCullCenter);
-                center = this.tempCullCenter;
-                radius = 0;
-            }
-        }
+        const { center, radius } = getTerrainObjectDrawRangeSphere(object, this.tempCullCenter, this.tempCullScale);
 
         // Distance check.
         const maxRange = maxDistance + radius;
@@ -2094,35 +2388,39 @@ export class TerrainScene {
         if (!this.renderer) {
             return 1;
         }
-        if (this.renderer instanceof THREE.WebGLRenderer) {
+        if (isWebGLRenderer(this.renderer)) {
             return this.renderer.capabilities.getMaxAnisotropy();
         }
 
-        const backend = this.renderer.backend as { getMaxAnisotropy?: () => number };
-        const value = backend.getMaxAnisotropy?.();
+        const value = this.renderer.backend.getMaxAnisotropy?.();
         // WebGPU spec guarantees 16x anisotropy support; fallback if backend doesn't expose the method.
         return typeof value === 'number' && Number.isFinite(value) ? value : 16;
     }
 
     private applyTerrainTextureQuality() {
         if (!this.terrainMesh) return;
-        const material = this.terrainMesh.material as THREE.Material & { map?: THREE.Texture | null };
-        const map = material.map;
-        if (!(map instanceof THREE.Texture)) {
-            return;
-        }
 
-        map.anisotropy = Math.max(1, Math.min(16, this.getRendererMaxAnisotropy()));
-        map.needsUpdate = true;
+        const anisotropy = Math.max(1, Math.min(16, this.getRendererMaxAnisotropy()));
+        this.forEachTerrainMaterial(this.terrainMesh, material => {
+            const map = (material as THREE.Material & { map?: THREE.Texture | null }).map;
+            if (!(map instanceof THREE.Texture)) {
+                return;
+            }
+
+            map.anisotropy = anisotropy;
+            map.needsUpdate = true;
+        });
     }
 
     private updateTerrainMaterialState() {
         if (this.terrainMesh && this.wireframeEl) {
-            const material = this.terrainMesh.material as THREE.Material & { wireframe?: boolean };
-            if ('wireframe' in material) {
-                material.wireframe = this.wireframeEl.checked;
-                material.needsUpdate = true;
-            }
+            this.forEachTerrainMaterial(this.terrainMesh, material => {
+                const terrainMaterial = material as THREE.Material & { wireframe?: boolean };
+                if ('wireframe' in terrainMaterial) {
+                    terrainMaterial.wireframe = this.wireframeEl!.checked;
+                    terrainMaterial.needsUpdate = true;
+                }
+            });
         }
         if (this.objectsGroup && this.showObjectsEl) {
             this.objectsGroup.visible = this.showObjectsEl.checked;
