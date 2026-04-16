@@ -32,7 +32,7 @@
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
     "css-loader": "^7.1.4",
-    "electron": "^41.2.0",
+    "electron": "^41.2.1",
     "electron-builder": "^26.8.1",
     "jest": "^30.3.0",
     "raw-loader": "^4.0.2",
@@ -40,9 +40,9 @@
     "ts-jest": "^29.4.9",
     "ts-loader": "^9.5.7",
     "typescript": "^6.0.2",
-    "vite": "^8.0.7",
-    "wait-on": "^9.0.4",
-    "webpack": "^5.105.4",
+    "vite": "^8.0.8",
+    "wait-on": "^9.0.5",
+    "webpack": "^5.106.2",
     "webpack-cli": "^7.0.2"
   },
   "build": {
