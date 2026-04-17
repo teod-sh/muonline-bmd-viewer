@@ -15,6 +15,11 @@ export interface TerrainObjectTransformOverride {
         y: number;
         z: number;
     };
+    rotation?: {
+        x: number;
+        y: number;
+        z: number;
+    };
     scale: number;
 }
 
@@ -105,6 +110,7 @@ export function upsertTerrainObjectTransformOverride(
                     ...existingWorld.objects,
                     [objectId]: {
                         position: { ...transform.position },
+                        ...(transform.rotation ? { rotation: { ...transform.rotation } } : {}),
                         scale: transform.scale,
                     },
                 },
@@ -264,6 +270,7 @@ function normalizeObjectTransform(value: unknown): TerrainObjectTransformOverrid
 
     const candidate = value as {
         position?: unknown;
+        rotation?: unknown;
         scale?: unknown;
     };
     const position = candidate.position as { x?: unknown; y?: unknown; z?: unknown } | undefined;
@@ -282,6 +289,7 @@ function normalizeObjectTransform(value: unknown): TerrainObjectTransformOverrid
     const scale = typeof candidate.scale === 'number' && Number.isFinite(candidate.scale)
         ? Math.max(0.01, candidate.scale)
         : 1;
+    const rotation = normalizeVector3(candidate.rotation);
 
     return {
         position: {
@@ -289,7 +297,32 @@ function normalizeObjectTransform(value: unknown): TerrainObjectTransformOverrid
             y: position.y,
             z: position.z,
         },
+        ...(rotation ? { rotation } : {}),
         scale,
+    };
+}
+
+function normalizeVector3(value: unknown): { x: number; y: number; z: number } | null {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+
+    const candidate = value as { x?: unknown; y?: unknown; z?: unknown };
+    if (
+        typeof candidate.x !== 'number' ||
+        typeof candidate.y !== 'number' ||
+        typeof candidate.z !== 'number' ||
+        !Number.isFinite(candidate.x) ||
+        !Number.isFinite(candidate.y) ||
+        !Number.isFinite(candidate.z)
+    ) {
+        return null;
+    }
+
+    return {
+        x: candidate.x,
+        y: candidate.y,
+        z: candidate.z,
     };
 }
 

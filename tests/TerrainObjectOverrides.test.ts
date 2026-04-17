@@ -36,12 +36,14 @@ describe('TerrainObjectOverrides', () => {
       '1:23:14700.00:13100.00',
       {
         position: { x: 14710, y: 165, z: 13120 },
+        rotation: { x: 0, y: 90, z: 15 },
         scale: 1.25,
       },
     );
 
     expect(getTerrainObjectTransformOverride(saved, 1, '1:23:14700.00:13100.00')).toEqual({
       position: { x: 14710, y: 165, z: 13120 },
+      rotation: { x: 0, y: 90, z: 15 },
       scale: 1.25,
     });
 
@@ -56,6 +58,7 @@ describe('TerrainObjectOverrides', () => {
           objects: {
             '1:23:14700.00:13100.00': {
               position: { x: 14710, y: 165, z: 13120 },
+              rotation: { x: 0, y: 90, z: 15 },
               scale: 1.25,
             },
             malformed: {
@@ -88,6 +91,7 @@ describe('TerrainObjectOverrides', () => {
           objects: {
             '1:23:14700.00:13100.00': {
               position: { x: 14710, y: 165, z: 13120 },
+              rotation: { x: 0, y: 90, z: 15 },
               scale: 1.25,
             },
           },

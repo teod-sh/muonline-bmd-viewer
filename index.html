@@ -626,6 +626,13 @@
               <p>Position: <span id="terrain-selected-position">-</span></p>
               <p>Rotation: <span id="terrain-selected-rotation">-</span></p>
               <p>Scale: <span id="terrain-selected-scale">-</span></p>
+              <div id="terrain-transform-gizmo-controls" class="terrain-transform-gizmo-controls space-top-sm">
+                <p class="control-note accent-note">Drag the gizmo in the render to move or rotate this object.</p>
+                <div class="row-inline terrain-transform-mode-row">
+                  <button class="modern-btn terrain-transform-mode-btn active" type="button" data-terrain-transform-mode="translate">Move Axes</button>
+                  <button class="modern-btn terrain-transform-mode-btn" type="button" data-terrain-transform-mode="rotate">Rotate Arcs</button>
+                </div>
+              </div>
               <div class="stack-sm space-top-sm">
                 <button id="terrain-focus-object-btn" class="modern-btn btn-primary">Focus</button>
                 <button id="terrain-isolate-object-btn" class="modern-btn">Hide Others</button>

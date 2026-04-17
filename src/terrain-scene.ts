@@ -1,6 +1,7 @@
 // src/terrain-scene.ts
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { TransformControls, type TransformControlsMode } from 'three/examples/jsm/controls/TransformControls.js';
 import type { ExplorerBookmark, ExplorerVector3, SelectedWorldObjectRef, TerrainSessionState } from './explorer-types';
 import { createId } from './explorer-store';
 import { TerrainLoader } from './terrain/TerrainLoader';
@@ -116,6 +117,12 @@ export class TerrainScene {
     private camera!: THREE.PerspectiveCamera;
     private renderer!: SupportedRenderer;
     private controls!: OrbitControls;
+    private transformControls: TransformControls | null = null;
+    private transformControlsHelper: THREE.Object3D | null = null;
+    private readonly transformProxy = new THREE.Object3D();
+    private transformControlMode: TransformControlsMode = 'translate';
+    private transformControlPointerActive = false;
+    private applyingTransformControlChange = false;
     private timer = new THREE.Timer();
     private isActive = false;
     private rendererBackendPreference: TerrainRendererBackendPreference = 'auto';
@@ -216,6 +223,8 @@ export class TerrainScene {
     private objectEditorSaveBtn: HTMLButtonElement | null = null;
     private objectEditorResetBtn: HTMLButtonElement | null = null;
     private objectEditorStatusEl: HTMLElement | null = null;
+    private objectTransformGizmoControlsEl: HTMLElement | null = null;
+    private transformModeButtons: HTMLButtonElement[] = [];
     private lastContextEl: HTMLElement | null = null;
     private tileCountEl: HTMLElement | null = null;
     private objectCountEl: HTMLElement | null = null;
@@ -445,11 +454,61 @@ export class TerrainScene {
         });
     }
 
+    private attachTransformControls(domElement: HTMLCanvasElement) {
+        this.disposeTransformControls();
+
+        const transformControls = new TransformControls(this.camera, domElement);
+        transformControls.setMode(this.transformControlMode);
+        transformControls.setSpace('world');
+        transformControls.setSize(1.15);
+        transformControls.addEventListener('dragging-changed', event => {
+            const dragging = event.value === true;
+            if (this.controls) {
+                this.controls.enabled = !dragging;
+            }
+            this.transformControlPointerActive = dragging;
+        });
+        transformControls.addEventListener('mouseDown', () => {
+            this.transformControlPointerActive = true;
+        });
+        transformControls.addEventListener('mouseUp', () => {
+            window.setTimeout(() => {
+                this.transformControlPointerActive = false;
+            }, 0);
+        });
+        transformControls.addEventListener('objectChange', () => this.handleTransformControlObjectChange());
+
+        const helper = transformControls.getHelper();
+        helper.visible = false;
+        this.scene.add(helper);
+        this.transformControls = transformControls;
+        this.transformControlsHelper = helper;
+        this.updateTransformControlAttachment();
+    }
+
+    private disposeTransformControls() {
+        if (this.transformControls) {
+            this.transformControls.detach();
+            this.transformControls.dispose();
+            this.transformControls = null;
+        }
+        if (this.transformControlsHelper) {
+            this.scene.remove(this.transformControlsHelper);
+            const disposableHelper = this.transformControlsHelper as THREE.Object3D & { dispose?: () => void };
+            disposableHelper.dispose?.();
+            this.transformControlsHelper = null;
+        }
+    }
+
     private attachCanvasPointerEvents(domElement: HTMLCanvasElement) {
         domElement.addEventListener('pointerdown', event => {
             this.pointerDown = { x: event.clientX, y: event.clientY };
         });
         domElement.addEventListener('pointerup', event => {
+            if (this.transformControlPointerActive || this.transformControls?.dragging) {
+                this.pointerDown = null;
+                return;
+            }
             if (!this.pointerDown || event.button !== 0) return;
             const dx = event.clientX - this.pointerDown.x;
             const dy = event.clientY - this.pointerDown.y;
@@ -487,6 +546,22 @@ export class TerrainScene {
         this.rendererBackendStatusEl.textContent = `Renderer: ${active} active (preferred: ${preferred})`;
     }
 
+    private isEditableShortcutTarget(target: EventTarget | null): boolean {
+        const element = target as HTMLElement | null;
+        if (!element) return false;
+        const tagName = element.tagName.toLowerCase();
+        return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || element.isContentEditable;
+    }
+
+    private setTransformControlMode(mode: TransformControlsMode) {
+        if (mode !== 'translate' && mode !== 'rotate') return;
+        this.transformControlMode = mode;
+        this.transformControls?.setMode(mode);
+        for (const button of this.transformModeButtons) {
+            button.classList.toggle('active', button.dataset.terrainTransformMode === mode);
+        }
+    }
+
     private clearWorldScene() {
         if (this.terrainMesh) {
             this.scene.remove(this.terrainMesh);
@@ -501,6 +576,7 @@ export class TerrainScene {
         this.animatedObjectInstances = [];
         this.selectedObjectRecord = null;
         this.isolatedObjectRecord = null;
+        this.updateTransformControlAttachment();
         this.minimapSourceCanvas = null;
         this.minimapNeedsRedraw = true;
         this.updateTerrainAttributePanel(null);
@@ -569,12 +645,14 @@ export class TerrainScene {
         if (this.controls) {
             this.controls.dispose();
         }
+        this.disposeTransformControls();
         if (previousDomElement?.parentElement === this.containerEl) {
             previousDomElement.parentElement.removeChild(previousDomElement);
         }
 
         this.containerEl.appendChild(renderer.domElement);
         this.attachControls(renderer.domElement);
+        this.attachTransformControls(renderer.domElement);
         this.attachCanvasPointerEvents(renderer.domElement);
 
         currentRenderer?.dispose();
@@ -614,6 +692,9 @@ export class TerrainScene {
 
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x87CEEB);
+        this.transformProxy.name = 'terrain_object_transform_proxy';
+        this.transformProxy.visible = false;
+        this.scene.add(this.transformProxy);
 
         const worldCenter = (TERRAIN_SIZE * TERRAIN_SCALE) / 2;
 
@@ -697,6 +778,8 @@ export class TerrainScene {
         this.objectPositionEl = document.getElementById('terrain-selected-position');
         this.objectRotationEl = document.getElementById('terrain-selected-rotation');
         this.objectScaleEl = document.getElementById('terrain-selected-scale');
+        this.objectTransformGizmoControlsEl = document.getElementById('terrain-transform-gizmo-controls');
+        this.transformModeButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('.terrain-transform-mode-btn'));
         this.openModelBtn = document.getElementById('terrain-open-model-btn') as HTMLButtonElement | null;
         this.openModelHintEl = document.getElementById('terrain-open-model-hint');
         this.objectEditorPanelEl = document.getElementById('terrain-object-editor-panel');
@@ -785,6 +868,18 @@ export class TerrainScene {
 
         window.addEventListener('keydown', (e) => {
             if (!this.terrainMesh || !this.isActive) return;
+            if (this.selectedObjectRecord && !this.isEditableShortcutTarget(e.target)) {
+                if (e.key.toLowerCase() === 't') {
+                    this.setTransformControlMode('translate');
+                    e.preventDefault();
+                    return;
+                }
+                if (e.key.toLowerCase() === 'r') {
+                    this.setTransformControlMode('rotate');
+                    e.preventDefault();
+                    return;
+                }
+            }
             const key = parseInt(e.key, 10);
             if (key >= 0 && key <= 4) {
                 const mat = this.terrainMesh.material;
@@ -794,6 +889,13 @@ export class TerrainScene {
                 }
             }
         });
+
+        for (const button of this.transformModeButtons) {
+            button.addEventListener('click', () => {
+                const mode = button.dataset.terrainTransformMode === 'rotate' ? 'rotate' : 'translate';
+                this.setTransformControlMode(mode);
+            });
+        }
 
         this.showObjectsEl?.addEventListener('change', () => {
             if (this.objectsGroup) {
@@ -1256,6 +1358,7 @@ export class TerrainScene {
         this.selectedObjectRecord = record;
         this.updateObjectInspector();
         this.updateSelectionMarker();
+        this.updateTransformControlAttachment();
         if (this.objectEditorPanelEl && !this.objectEditorPanelEl.classList.contains('hidden')) {
             this.populateObjectEditorPanel();
         }
@@ -1267,9 +1370,104 @@ export class TerrainScene {
         this.selectedObjectRecord = null;
         this.updateObjectInspector();
         this.updateSelectionMarker();
+        this.updateTransformControlAttachment();
         this.closeObjectEditorPanel();
         this.onObjectSelected?.(null);
         this.minimapNeedsRedraw = true;
+    }
+
+    private updateTransformControlAttachment() {
+        const controls = this.transformControls;
+        const helper = this.transformControlsHelper;
+        const record = this.selectedObjectRecord;
+
+        if (!controls || !helper || !record) {
+            controls?.detach();
+            if (helper) helper.visible = false;
+            this.transformProxy.visible = false;
+            return;
+        }
+
+        this.applyingTransformControlChange = true;
+        this.transformProxy.position.set(
+            record.selection.position.x,
+            record.selection.position.y,
+            record.selection.position.z,
+        );
+        this.transformProxy.quaternion.copy(this.getRecordVisualQuaternion(record));
+        this.transformProxy.scale.setScalar(Math.max(0.01, record.selection.scale));
+        this.transformProxy.visible = true;
+        this.transformProxy.updateMatrix();
+        this.transformProxy.updateMatrixWorld(true);
+        controls.attach(this.transformProxy);
+        controls.setMode(this.transformControlMode);
+        helper.visible = true;
+        this.applyingTransformControlChange = false;
+    }
+
+    private getRecordVisualQuaternion(record: TerrainObjectSelectionRecord): THREE.Quaternion {
+        if (record.object3D) {
+            return record.object3D.quaternion.clone();
+        }
+
+        if (record.instancedMesh && typeof record.instanceId === 'number') {
+            const matrix = new THREE.Matrix4();
+            const position = new THREE.Vector3();
+            const quaternion = new THREE.Quaternion();
+            const scale = new THREE.Vector3();
+            record.instancedMesh.getMatrixAt(record.instanceId, matrix);
+            matrix.decompose(position, quaternion, scale);
+            return quaternion;
+        }
+
+        return this.rotationVectorToQuaternion(record.selection.rotation);
+    }
+
+    private rotationVectorToQuaternion(rotation: ExplorerVector3): THREE.Quaternion {
+        const euler = new THREE.Euler(
+            THREE.MathUtils.degToRad(rotation.x),
+            THREE.MathUtils.degToRad(rotation.y),
+            THREE.MathUtils.degToRad(rotation.z),
+            'XYZ',
+        );
+        return new THREE.Quaternion().setFromEuler(euler);
+    }
+
+    private quaternionToRotationVector(quaternion: THREE.Quaternion): ExplorerVector3 {
+        const euler = new THREE.Euler().setFromQuaternion(quaternion, 'XYZ');
+        return {
+            x: this.normalizeDegrees(THREE.MathUtils.radToDeg(euler.x)),
+            y: this.normalizeDegrees(THREE.MathUtils.radToDeg(euler.y)),
+            z: this.normalizeDegrees(THREE.MathUtils.radToDeg(euler.z)),
+        };
+    }
+
+    private normalizeDegrees(value: number): number {
+        const normalized = ((value % 360) + 360) % 360;
+        return Math.abs(normalized - 360) < 0.0001 ? 0 : normalized;
+    }
+
+    private handleTransformControlObjectChange() {
+        if (this.applyingTransformControlChange) return;
+
+        const record = this.selectedObjectRecord;
+        if (!record) return;
+
+        const objectId = record.selection.objectId;
+        const matchingRecords = this.objectRecords.filter(candidate => candidate.selection.objectId === objectId);
+        const nextPosition = this.toExplorerVector3(this.transformProxy.position);
+        const nextScale = Math.max(0.01, this.transformProxy.scale.x || record.selection.scale);
+        const nextQuaternion = this.transformProxy.quaternion.clone();
+        const nextRotation = this.quaternionToRotationVector(nextQuaternion);
+
+        this.applyTransformToObjectRecords(matchingRecords, nextPosition, nextScale, nextRotation, nextQuaternion);
+        this.updateObjectInspector();
+        this.updateSelectionMarker();
+        if (this.objectEditorPanelEl && !this.objectEditorPanelEl.classList.contains('hidden')) {
+            this.populateObjectEditorPanel();
+        }
+        this.minimapNeedsRedraw = true;
+        this.emitStateChanged();
     }
 
     private updateObjectInspector() {
@@ -1277,6 +1475,7 @@ export class TerrainScene {
         if (!record) {
             this.objectDetailsEl?.classList.add('hidden');
             this.objectEmptyEl?.classList.remove('hidden');
+            this.objectTransformGizmoControlsEl?.classList.add('hidden');
             if (this.openModelHintEl) {
                 this.openModelHintEl.textContent = 'Select an object to inspect it.';
             }
@@ -1288,6 +1487,7 @@ export class TerrainScene {
 
         this.objectDetailsEl?.classList.remove('hidden');
         this.objectEmptyEl?.classList.add('hidden');
+        this.objectTransformGizmoControlsEl?.classList.remove('hidden');
         if (this.objectWorldEl) this.objectWorldEl.textContent = `${record.selection.worldNumber}`;
         if (this.objectTypeEl) this.objectTypeEl.textContent = `${record.selection.type}`;
         if (this.objectModelEl) this.objectModelEl.textContent = record.selection.modelName || 'Unresolved';
@@ -1458,6 +1658,7 @@ export class TerrainScene {
 
         this.updateObjectInspector();
         this.updateSelectionMarker();
+        this.updateTransformControlAttachment();
         this.minimapNeedsRedraw = true;
         this.emitStateChanged();
         this.setObjectEditorStatus('Transform applied to selected object.');
@@ -1467,12 +1668,15 @@ export class TerrainScene {
         matchingRecords: TerrainObjectSelectionRecord[],
         nextPosition: ExplorerVector3,
         nextScale: number,
+        nextRotation?: ExplorerVector3,
+        nextQuaternion?: THREE.Quaternion,
     ) {
         if (matchingRecords.length === 0) return;
 
         const oldPosition = { ...matchingRecords[0].selection.position };
         const oldScale = Math.max(0.01, matchingRecords[0].selection.scale);
         const scaleRatio = nextScale / oldScale;
+        const resolvedNextQuaternion = nextQuaternion ?? (nextRotation ? this.rotationVectorToQuaternion(nextRotation) : undefined);
         const positionDelta = new THREE.Vector3(
             nextPosition.x - oldPosition.x,
             nextPosition.y - oldPosition.y,
@@ -1482,16 +1686,22 @@ export class TerrainScene {
         for (const candidate of matchingRecords) {
             this.ensureObjectRecordDefaultTransform(candidate);
             candidate.selection.position = { ...nextPosition };
+            if (nextRotation) {
+                candidate.selection.rotation = { ...nextRotation };
+            }
             candidate.selection.scale = nextScale;
             candidate.approximateRadius *= scaleRatio;
 
             if (candidate.object3D) {
                 candidate.object3D.position.set(nextPosition.x, nextPosition.y, nextPosition.z);
+                if (resolvedNextQuaternion) {
+                    candidate.object3D.quaternion.copy(resolvedNextQuaternion);
+                }
                 candidate.object3D.scale.setScalar(nextScale);
                 candidate.object3D.updateMatrix();
                 candidate.object3D.updateMatrixWorld(true);
             } else if (candidate.instancedMesh && typeof candidate.instanceId === 'number') {
-                this.updateInstancedObjectTransform(candidate, positionDelta, scaleRatio);
+                this.updateInstancedObjectTransform(candidate, positionDelta, scaleRatio, resolvedNextQuaternion);
                 updatedInstancedMeshes.add(candidate.instancedMesh);
             }
         }
@@ -1509,6 +1719,7 @@ export class TerrainScene {
         const selectionWithDefault = record.selection as SelectedWorldObjectRef & {
             userDataDefaultTransform?: {
                 position: ExplorerVector3;
+                rotation: ExplorerVector3;
                 scale: number;
                 approximateRadius: number;
             };
@@ -1519,6 +1730,7 @@ export class TerrainScene {
 
         selectionWithDefault.userDataDefaultTransform = {
             position: { ...record.selection.position },
+            rotation: { ...record.selection.rotation },
             scale: record.selection.scale,
             approximateRadius: record.approximateRadius,
         };
@@ -1529,18 +1741,20 @@ export class TerrainScene {
         const defaultTransform = (records[0].selection as SelectedWorldObjectRef & {
             userDataDefaultTransform?: {
                 position: ExplorerVector3;
+                rotation?: ExplorerVector3;
                 scale: number;
             };
         }).userDataDefaultTransform;
         if (!defaultTransform) return;
 
-        this.applyTransformToObjectRecords(records, defaultTransform.position, defaultTransform.scale);
+        this.applyTransformToObjectRecords(records, defaultTransform.position, defaultTransform.scale, defaultTransform.rotation);
     }
 
     private updateInstancedObjectTransform(
         record: TerrainObjectSelectionRecord,
         positionDelta: THREE.Vector3,
         scaleRatio: number,
+        nextQuaternion?: THREE.Quaternion,
     ) {
         if (!record.instancedMesh || typeof record.instanceId !== 'number') return;
 
@@ -1551,6 +1765,9 @@ export class TerrainScene {
         record.instancedMesh.getMatrixAt(record.instanceId, matrix);
         matrix.decompose(position, rotation, scale);
         position.add(positionDelta);
+        if (nextQuaternion) {
+            rotation.copy(nextQuaternion);
+        }
         scale.multiplyScalar(scaleRatio);
         matrix.compose(position, rotation, scale);
         record.instancedMesh.setMatrixAt(record.instanceId, matrix);
@@ -1577,6 +1794,7 @@ export class TerrainScene {
             record.selection.objectId,
             {
                 position: { ...record.selection.position },
+                rotation: { ...record.selection.rotation },
                 scale: record.selection.scale,
             },
         );
@@ -1602,6 +1820,7 @@ export class TerrainScene {
         this.restoreMaterialDefaultsForType(record.selection.worldNumber, record.selection.type);
         this.updateObjectInspector();
         this.updateSelectionMarker();
+        this.updateTransformControlAttachment();
         this.populateObjectEditorPanel();
         await this.writeObjectOverrides('Reset object settings');
     }
@@ -1616,6 +1835,7 @@ export class TerrainScene {
                 matchingRecords,
                 transformOverride.position,
                 transformOverride.scale,
+                transformOverride.rotation,
             );
         }
 
