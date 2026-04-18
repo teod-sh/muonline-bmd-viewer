@@ -9,6 +9,7 @@ const VIEW_BADGE: Record<ViewerTab, string> = {
   items: 'Item Browser',
   skills: 'Skill Browser',
   gfx: 'GFx Browser',
+  sound: 'Sound Browser',
 };
 
 export function notifyViewportResize(): void {
@@ -43,6 +44,7 @@ export function setActiveControlMenuView(target: ViewerTab): void {
     items: document.getElementById('sidebar-items'),
     skills: document.getElementById('sidebar-skills'),
     gfx: document.getElementById('sidebar-gfx'),
+    sound: document.getElementById('sidebar-sound'),
   };
   const mainViews: Record<ViewerTab, HTMLElement | null> = {
     bmd: document.getElementById('view-bmd'),
@@ -53,6 +55,7 @@ export function setActiveControlMenuView(target: ViewerTab): void {
     items: document.getElementById('view-items'),
     skills: document.getElementById('view-skills'),
     gfx: document.getElementById('view-gfx'),
+    sound: document.getElementById('view-sound'),
   };
   const statusElements: Record<ViewerTab, HTMLElement | null> = {
     bmd: document.getElementById('status'),
@@ -63,6 +66,7 @@ export function setActiveControlMenuView(target: ViewerTab): void {
     items: document.getElementById('items-status-bar'),
     skills: document.getElementById('skills-status-bar'),
     gfx: document.getElementById('gfx-status-bar'),
+    sound: document.getElementById('sound-status-bar'),
   };
 
   tabButtons.forEach(button => {

@@ -1826,10 +1826,12 @@ body.presentation-mode #att-status-bar {
 /* ── Main view layout ── */
 #view-items,
 #view-skills,
-#view-gfx {
+#view-gfx,
+#view-sound {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  min-height: 0;
 }
 
 .bmd-browser-empty {

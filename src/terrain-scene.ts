@@ -5,6 +5,7 @@ import { TransformControls, type TransformControlsMode } from 'three/examples/js
 import type { ExplorerBookmark, ExplorerVector3, SelectedWorldObjectRef, TerrainSessionState } from './explorer-types';
 import { createId } from './explorer-store';
 import { TerrainLoader } from './terrain/TerrainLoader';
+import { TerrainAttOverlay } from './terrain/TerrainAttOverlay';
 import {
     loadTerrainObjects,
     mapObjectAngleToVisualQuaternion,
@@ -162,6 +163,7 @@ export class TerrainScene {
     private readonly pointer = new THREE.Vector2();
 
     private terrainMesh: THREE.Mesh | null = null;
+    private terrainAttOverlay: TerrainAttOverlay | null = null;
     private objectsGroup: THREE.Group | null = null;
     private terrainLoader = new TerrainLoader();
     private objectRecords: TerrainObjectSelectionRecord[] = [];
@@ -245,6 +247,7 @@ export class TerrainScene {
     private terrainAttributeTilesEl: HTMLElement | null = null;
     private terrainAttributeOccupiedEl: HTMLElement | null = null;
     private terrainAttributeLegendEl: HTMLElement | null = null;
+    private attOverlayToggleBtn: HTMLButtonElement | null = null;
     private objectOverrides: TerrainObjectOverridesFile = createEmptyTerrainObjectOverrides();
     private objectOverridesPath: string | null = null;
 
@@ -581,6 +584,9 @@ export class TerrainScene {
             this.scene.remove(this.objectsGroup);
             this.objectsGroup = null;
         }
+        if (this.terrainAttOverlay) {
+            this.terrainAttOverlay.setData(null);
+        }
         this.objectRecords = [];
         this.animatedObjectInstances = [];
         this.loadedObjectsData = null;
@@ -707,6 +713,12 @@ export class TerrainScene {
         this.transformProxy.visible = false;
         this.scene.add(this.transformProxy);
 
+        this.terrainAttOverlay = new TerrainAttOverlay(this.scene);
+        const overlayMesh = this.terrainAttOverlay.getWorldMesh();
+        if (overlayMesh) {
+            this.scene.add(overlayMesh);
+        }
+
         const worldCenter = (TERRAIN_SIZE * TERRAIN_SCALE) / 2;
 
         this.camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 10, 100000);
@@ -818,7 +830,18 @@ export class TerrainScene {
         this.terrainAttributeTilesEl = document.getElementById('terrain-attribute-tiles');
         this.terrainAttributeOccupiedEl = document.getElementById('terrain-attribute-occupied');
         this.terrainAttributeLegendEl = document.getElementById('terrain-attribute-legend');
+        this.attOverlayToggleBtn = document.getElementById('att-overlay-toggle') as HTMLButtonElement | null;
         this.updateTerrainAttributePanel(null);
+
+        if (this.attOverlayToggleBtn) {
+            this.attOverlayToggleBtn.addEventListener('click', () => {
+                if (this.terrainAttOverlay) {
+                    const isCurrentlyVisible = this.terrainAttOverlay.isVisible();
+                    this.terrainAttOverlay.setVisible(!isCurrentlyVisible);
+                    this.attOverlayToggleBtn!.textContent = isCurrentlyVisible ? 'Show ATT Overlay' : 'Hide ATT Overlay';
+                }
+            });
+        }
 
         if (dropZone && folderInput) {
             dropZone.addEventListener('click', () => {
@@ -2424,6 +2447,22 @@ export class TerrainScene {
                 : '-';
         }
         this.renderTerrainAttributeLegend(summary?.flags ?? null);
+        if (this.terrainAttOverlay) {
+            this.terrainAttOverlay.setData(this.loadedAttData, this.getTerrainOverlaySourceGeometry());
+        }
+    }
+
+    private getTerrainOverlaySourceGeometry(): THREE.BufferGeometry | null {
+        if (!this.terrainMesh) {
+            return null;
+        }
+
+        const minimapGeometry = this.terrainMesh.userData.minimapGeometry;
+        if (minimapGeometry instanceof THREE.BufferGeometry) {
+            return minimapGeometry;
+        }
+
+        return this.terrainMesh.geometry ?? null;
     }
 
     private renderTerrainAttributeLegend(flags: TerrainAttributeFlagSummary[] | null) {

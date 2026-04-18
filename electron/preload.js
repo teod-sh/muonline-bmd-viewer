@@ -39,6 +39,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Write a file below a user-selected export directory
   writeFileInDirectory: (rootPath, relativePath, data) => ipcRenderer.invoke('fs:writeFileInDirectory', rootPath, relativePath, data),
 
+  // List sound files in a directory
+  readDir: (dirPath) => ipcRenderer.invoke('fs:readDir', dirPath),
+
   // Get real file path from File object (for drag & drop)
   getFilePath: (file) => {
     try {

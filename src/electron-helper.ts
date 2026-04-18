@@ -37,6 +37,7 @@ interface ElectronAPI {
   readTerrainObjectOverrides: () => Promise<TerrainObjectOverridesFileData>;
   writeTerrainObjectOverrides: (data: unknown) => Promise<TerrainObjectOverridesWriteResult>;
   writeFileInDirectory: (rootPath: string, relativePath: string, data: ArrayBuffer) => Promise<FileWriteResult>;
+  readDir: (dirPath: string) => Promise<Array<{ name: string; path: string }>>;
   getFilePath: (file: File) => string | null;
 }
 

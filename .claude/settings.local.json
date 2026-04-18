@@ -26,7 +26,11 @@
       "Bash(node /root/.claude/plugins/cache/thedotmack/claude-mem/8.0.6/scripts/context-hook.js)",
       "Bash(serena-hooks activate *)",
       "Bash(node /root/.claude/plugins/cache/thedotmack/claude-mem/8.0.6/scripts/user-message-hook.js)",
-      "Bash(rtk wc *)"
+      "Bash(rtk wc *)",
+      "Bash(rtk ls *)",
+      "Bash(rtk read *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk tsc *)"
     ],
     "deny": [],
     "ask": []

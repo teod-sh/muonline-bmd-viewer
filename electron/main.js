@@ -148,6 +148,18 @@ ipcMain.handle('dialog:openDirectory', async () => {
   return filePaths[0];
 });
 
+// List files in a directory (returns [{name, path}])
+ipcMain.handle('fs:readDir', async (event, dirPath) => {
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    return entries
+      .filter(e => e.isFile())
+      .map(e => ({ name: e.name, path: path.join(dirPath, e.name) }));
+  } catch {
+    return [];
+  }
+});
+
 // Read file as ArrayBuffer
 ipcMain.handle('fs:readFile', async (event, filePath) => {
   try {
